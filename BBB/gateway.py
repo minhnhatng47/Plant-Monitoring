@@ -7,7 +7,7 @@ from datetime import datetime
 # ==========================================
 # 1. CẤU HÌNH INFLUXDB CLOUD (Thay bằng thông tin của bạn)
 # ==========================================
-INFLUX_URL = "https://us-east-1-1.aws.cloud2.influxdata.com/orgs/40364a2aa853cfaa/load-data/buckets" ��
+INFLUX_URL = "https://us-east-1-1.aws.cloud2.influxdata.com"
 INFLUX_TOKEN = "6pSuWQaFLlWq6iRVfaRYEMwIO1DDEChBsG42HdDx5En6fuqpUx95j3xswbVNrcWxRrs_sizN6XXESjzNqcHzJA=="
 INFLUX_ORG = "DEV_TEAM"
 INFLUX_BUCKET = "digital_twin_data"
@@ -17,7 +17,7 @@ INFLUX_BUCKET = "digital_twin_data"
 # ==========================================
 MQTT_BROKER = "127.0.0.1" # Lắng nghe ngay trên chính BeagleBone
 MQTT_PORT = 1883
-MQTT_TOPIC = "telemetry/esp32/#"
+MQTT_TOPIC = "cps/greenhouse/sensors"
 
 # Khởi tạo InfluxDB Client (Ghi bất đồng bộ chống lag)
 client_influx = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG)
