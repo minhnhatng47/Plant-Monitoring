@@ -1,6 +1,31 @@
-[
-    "temperature",
-    "air_humidity",
-    "lux",
-    "soil_moisture"
-]
+{
+    "_meta": {
+        "version": "2.2-esp32-rtc-phase-owner",
+        "node_id": "BRASSICA_JUNCEA_01",
+        "plant": "Rau Cải Mầm (Brassica juncea)",
+        "model": "watering_random_forest_model.pkl",
+        "model_status": "unified_baseline",
+        "note": "Phase do ESP32 tính bằng DS3231 RTC và gửi lên JSON. Gateway chỉ dùng phase đó cho ML/alert, không tự chuyển phase bằng lux và không publish cmd/phase."
+    },
+
+    "phase": 0,
+    "lux_phase2_threshold": 50,
+
+    "soil_force_on": 25,
+    "soil_force_off": 55,
+    "dry_soil_threshold_phase1": 35,
+    "dry_soil_threshold_phase2": 40,
+
+    "min_on_steps": 1,
+    "max_on_steps_normal": 3,
+    "max_on_steps_dry_phase1": 6,
+    "max_on_steps_dry_phase2": 5,
+    "cooldown_steps": 2,
+
+    "light_schedule_phase2": {
+        "on_hour_utc7": 6,
+        "off_hour_utc7": 20,
+        "duration_hours": 14,
+        "owner": "ESP32_RTC"
+    }
+}
