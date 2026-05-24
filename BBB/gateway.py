@@ -46,6 +46,9 @@ except ImportError as e:
     print("Chạy: pip install paho-mqtt influxdb-client joblib pandas scikit-learn")
     sys.exit(1)
 
+# Tương thích nhiều phiên bản influxdb-client.
+WRITE_PRECISION_SECONDS = getattr(WritePrecision, "S", None) or getattr(WritePrecision, "SECONDS")
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CẤU HÌNH — SỬA THEO MÔI TRƯỜNG THỰC TẾ
@@ -413,11 +416,49 @@ class EdgeAIWateringController:
                 f"features={self.features})")
 
 
+def _normalize_feature_list(model, raw_features):
+    """Trả về list feature hợp lệ cho sklearn model.
+
+    model_features.json nên là list, ví dụ:
+        ["temperature", "air_humidity", "lux", "soil_moisture"]
+
+    Nếu người dùng copy nhầm controller_config.json vào model_features.json,
+    gateway sẽ fallback theo feature_names_in_ của model để không chết ngay.
+    """
+    if isinstance(raw_features, list) and all(isinstance(x, str) for x in raw_features):
+        return raw_features
+
+    if isinstance(raw_features, dict):
+        maybe = raw_features.get("features")
+        if isinstance(maybe, list) and all(isinstance(x, str) for x in maybe):
+            return maybe
+
+    model_features = getattr(model, "feature_names_in_", None)
+    if model_features is not None:
+        return [str(x) for x in list(model_features)]
+
+    return ["temperature", "air_humidity", "lux", "soil_moisture"]
+
+
 def load_controller(model_path, features_path,
                     config_path=None) -> EdgeAIWateringController:
     model = joblib.load(model_path)
-    with open(features_path, "r", encoding="utf-8") as f:
-        features = json.load(f)
+
+    raw_features = None
+    if features_path and os.path.exists(features_path):
+        with open(features_path, "r", encoding="utf-8") as f:
+            raw_features = json.load(f)
+
+    features = _normalize_feature_list(model, raw_features)
+
+    n_model = getattr(model, "n_features_in_", None)
+    if n_model is not None and len(features) != int(n_model):
+        raise ValueError(
+            f"model_features.json có {len(features)} feature {features}, "
+            f"nhưng model cần {n_model} feature. "
+            f"Hãy dùng đúng model_features.json được tạo cùng file .pkl."
+        )
+
     config = {}
     if config_path and os.path.exists(config_path):
         with open(config_path, "r", encoding="utf-8") as f:
@@ -523,6 +564,7 @@ def parse_sensor(raw: dict) -> dict:
         "soil_s1": s1, "soil_s2": s2, "soil_s3": s3, "soil_s4": s4,
         "phase":        esp_phase,
         "phase_source": raw.get("phase_source", "MISSING"),
+        "esp_step":     int(raw.get("step", 0) or 0),
         "days_after_planting": float(raw.get("days_after_planting", -1.0) or -1.0),
         "light_state":  light_state,
         "light_mode":   light_mode,
@@ -583,10 +625,11 @@ def push_influx(write_api, payload: dict, log):
             .field("light", 1 if ctrl["light"]["state"] == "ON" else 0)
             # Meta
             .field("step",      int(payload.get("step") or 0))
+            .field("gw_step",   int(payload.get("gw_step") or 0))
             .field("uptime_s",  int(payload.get("uptime_s",  0)))
             .field("wifi_rssi", int(payload.get("wifi_rssi", 0)))
             .field("days_after_planting", float(payload.get("days_after_planting", -1.0)))
-            .time(datetime.now(timezone.utc), WritePrecision.SECONDS)
+            .time(datetime.now(timezone.utc), WRITE_PRECISION_SECONDS)
         )
         write_api.write(bucket=INFLUX_BUCKET, record=point)
         log.debug(f"[InfluxDB] ✓ step={payload.get('step')}")
@@ -624,6 +667,10 @@ def process(mqtt_client, controller, write_api, raw: dict, log):
     esp_phase    = s.get("phase")
     phase_source = s.get("phase_source", "MISSING")
     days_after_planting = s.get("days_after_planting", -1.0)
+    esp_step = int(s.get("esp_step", 0) or 0)
+    gw_step = step
+    # Ưu tiên step do ESP32 gửi để log khớp với firmware; nếu thiếu thì dùng counter gateway.
+    step = esp_step if esp_step > 0 else gw_step
 
     # ── AI decision ───────────────────────────────────────────────────────────
     try:
@@ -655,6 +702,7 @@ def process(mqtt_client, controller, write_api, raw: dict, log):
     payload["alert"]     = "; ".join(alerts) if alerts else None
     payload["phase_source"] = phase_source
     payload["days_after_planting"] = days_after_planting
+    payload["gw_step"] = gw_step
     payload["uptime_s"]  = s["uptime_s"]
     payload["wifi_rssi"] = s["wifi_rssi"]
 
@@ -702,7 +750,7 @@ def make_callbacks(controller, write_api, log):
         codes = {0:"OK", 1:"Protocol", 2:"Client ID",
                  3:"Unavailable", 4:"Credentials", 5:"Unauthorized"}
         if rc == 0:
-            log.info(f"✅ MQTT connected → subscribe {TOPIC_SENSOR}; publish phase on each sensor packet")
+            log.info(f"✅ MQTT connected → subscribe {TOPIC_SENSOR}; pump control only")
             client.subscribe(TOPIC_SENSOR, qos=MQTT_QOS)
             client.publish(TOPIC_STATUS, json.dumps({
                 "node_id":    NODE_ID,
@@ -846,5 +894,4 @@ def main():
 
 
 if __name__ == "__main__":
-    
     main()

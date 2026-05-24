@@ -2263,9 +2263,9 @@
 					)
 				)
 				(pin input line
-					(at 20.32 -25.4 180)
+					(at 20.32 20.32 180)
 					(length 2.54)
-					(name "NC"
+					(name "GND"
 						(effects
 							(font
 								(size 1.27 1.27)
@@ -2281,9 +2281,9 @@
 					)
 				)
 				(pin input line
-					(at 20.32 -22.86 180)
+					(at 20.32 17.78 180)
 					(length 2.54)
-					(name "NC"
+					(name "23"
 						(effects
 							(font
 								(size 1.27 1.27)
@@ -2299,9 +2299,9 @@
 					)
 				)
 				(pin input line
-					(at 20.32 -20.32 180)
+					(at 20.32 15.24 180)
 					(length 2.54)
-					(name "NC"
+					(name "22"
 						(effects
 							(font
 								(size 1.27 1.27)
@@ -2317,9 +2317,9 @@
 					)
 				)
 				(pin input line
-					(at 20.32 -17.78 180)
+					(at 20.32 12.7 180)
 					(length 2.54)
-					(name "15"
+					(name "T0"
 						(effects
 							(font
 								(size 1.27 1.27)
@@ -2335,9 +2335,9 @@
 					)
 				)
 				(pin input line
-					(at 20.32 -15.24 180)
+					(at 20.32 10.16 180)
 					(length 2.54)
-					(name "2"
+					(name "R0"
 						(effects
 							(font
 								(size 1.27 1.27)
@@ -2353,9 +2353,9 @@
 					)
 				)
 				(pin input line
-					(at 20.32 -12.7 180)
+					(at 20.32 7.62 180)
 					(length 2.54)
-					(name "B"
+					(name "21"
 						(effects
 							(font
 								(size 1.27 1.27)
@@ -2371,9 +2371,9 @@
 					)
 				)
 				(pin input line
-					(at 20.32 -10.16 180)
+					(at 20.32 5.08 180)
 					(length 2.54)
-					(name "4"
+					(name "GND"
 						(effects
 							(font
 								(size 1.27 1.27)
@@ -2389,9 +2389,9 @@
 					)
 				)
 				(pin input line
-					(at 20.32 -7.62 180)
+					(at 20.32 2.54 180)
 					(length 2.54)
-					(name "16"
+					(name "19"
 						(effects
 							(font
 								(size 1.27 1.27)
@@ -2407,9 +2407,9 @@
 					)
 				)
 				(pin input line
-					(at 20.32 -5.08 180)
+					(at 20.32 0 180)
 					(length 2.54)
-					(name "17"
+					(name "18"
 						(effects
 							(font
 								(size 1.27 1.27)
@@ -2443,9 +2443,9 @@
 					)
 				)
 				(pin input line
-					(at 20.32 0 180)
+					(at 20.32 -5.08 180)
 					(length 2.54)
-					(name "18"
+					(name "17"
 						(effects
 							(font
 								(size 1.27 1.27)
@@ -2461,9 +2461,9 @@
 					)
 				)
 				(pin input line
-					(at 20.32 2.54 180)
+					(at 20.32 -7.62 180)
 					(length 2.54)
-					(name "19"
+					(name "16"
 						(effects
 							(font
 								(size 1.27 1.27)
@@ -2479,9 +2479,9 @@
 					)
 				)
 				(pin input line
-					(at 20.32 5.08 180)
+					(at 20.32 -10.16 180)
 					(length 2.54)
-					(name "GND"
+					(name "4"
 						(effects
 							(font
 								(size 1.27 1.27)
@@ -2497,9 +2497,9 @@
 					)
 				)
 				(pin input line
-					(at 20.32 7.62 180)
+					(at 20.32 -12.7 180)
 					(length 2.54)
-					(name "21"
+					(name "B"
 						(effects
 							(font
 								(size 1.27 1.27)
@@ -2515,9 +2515,9 @@
 					)
 				)
 				(pin input line
-					(at 20.32 10.16 180)
+					(at 20.32 -15.24 180)
 					(length 2.54)
-					(name "R0"
+					(name "2"
 						(effects
 							(font
 								(size 1.27 1.27)
@@ -2533,9 +2533,9 @@
 					)
 				)
 				(pin input line
-					(at 20.32 12.7 180)
+					(at 20.32 -17.78 180)
 					(length 2.54)
-					(name "T0"
+					(name "15"
 						(effects
 							(font
 								(size 1.27 1.27)
@@ -2551,9 +2551,9 @@
 					)
 				)
 				(pin input line
-					(at 20.32 15.24 180)
+					(at 20.32 -20.32 180)
 					(length 2.54)
-					(name "22"
+					(name "NC"
 						(effects
 							(font
 								(size 1.27 1.27)
@@ -2569,9 +2569,9 @@
 					)
 				)
 				(pin input line
-					(at 20.32 17.78 180)
+					(at 20.32 -22.86 180)
 					(length 2.54)
-					(name "23"
+					(name "NC"
 						(effects
 							(font
 								(size 1.27 1.27)
@@ -2587,9 +2587,9 @@
 					)
 				)
 				(pin input line
-					(at 20.32 20.32 180)
+					(at 20.32 -25.4 180)
 					(length 2.54)
-					(name "GND"
+					(name "NC"
 						(effects
 							(font
 								(size 1.27 1.27)

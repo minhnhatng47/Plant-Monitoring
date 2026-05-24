@@ -1,11 +1,11 @@
 {
     "_meta": {
-        "version": "2.2-esp32-rtc-phase-owner",
+        "version": "2.0",
         "node_id": "BRASSICA_JUNCEA_01",
         "plant": "Rau Cải Mầm (Brassica juncea)",
         "model": "watering_random_forest_model.pkl",
-        "model_status": "unified_baseline",
-        "note": "Phase do ESP32 tính bằng DS3231 RTC và gửi lên JSON. Gateway chỉ dùng phase đó cho ML/alert, không tự chuyển phase bằng lux và không publish cmd/phase."
+        "model_status": "phase1_only",
+        "note": "Dùng tạm khi chờ data Phase 2. Sau khi có data → train_unified_model.py → đổi model_status thành unified"
     },
 
     "phase": 0,
@@ -23,10 +23,9 @@
     "cooldown_steps": 2,
 
     "light_schedule_phase2": {
-        "on_hour_utc7": 6,
+        "on_hour_utc7":  6,
         "off_hour_utc7": 20,
-        "duration_hours": 14,
-        "owner": "ESP32_RTC"
+        "duration_hours": 14
     }
 }
 
