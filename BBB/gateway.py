@@ -1,12 +1,12 @@
 """
-gateway.py — BBB Edge AI Gateway v2.0
+gateway.py — BBB Edge AI Gateway v2.2
 ======================================
 Rau Cải Mầm (Brassica juncea) | BRASSICA_JUNCEA_01
 
 File duy nhất chạy trên BeagleBone Black — tích hợp đầy đủ:
-  • EdgeAIWateringController (Phase 1/2 tự nhận diện qua lux)
+  • EdgeAIWateringController (Phase 1/2 lấy từ ESP32 RTC)
   • MQTT subscriber (nhận sensor từ ESP32)
-  • MQTT publisher  (gửi cmd/pump + cmd/light xuống ESP32)
+  • MQTT publisher  (gửi cmd/pump xuống ESP32; đèn/phase do ESP32 RTC tự xử lý)
   • InfluxDB Cloud writer
   • Alert engine theo ngưỡng Brassica juncea
   • Graceful shutdown + auto-reconnect + retry
@@ -53,7 +53,7 @@ except ImportError as e:
 
 NODE_ID    = "BRASSICA_JUNCEA_01"
 PLANT_NAME = "Rau Cải Mầm (Brassica juncea)"
-GW_VERSION = "2.1.0-phase-sync"
+GW_VERSION = "2.2.0-esp32-rtc-phase"
 
 # ── MQTT (Mosquitto local trên BBB) ─────────────────────────────────────────
 MQTT_BROKER    = "127.0.0.1"       # Mosquitto chạy ngay trên BBB
@@ -64,8 +64,7 @@ MQTT_QOS       = 1
 
 TOPIC_SENSOR    = "cps/greenhouse/sensors"
 TOPIC_CMD_PUMP  = "cps/greenhouse/cmd/pump"
-TOPIC_CMD_LIGHT = "cps/greenhouse/cmd/light"   # legacy/manual only
-TOPIC_CMD_PHASE = "cps/greenhouse/cmd/phase"   # BBB -> ESP32: 1 hoặc 2
+TOPIC_CMD_LIGHT = "cps/greenhouse/cmd/light"   # legacy/manual only, hiện không publish trong AUTO
 TOPIC_STATUS    = "cps/greenhouse/status"
 
 # ── InfluxDB Cloud ───────────────────────────────────────────────────────────
@@ -127,9 +126,9 @@ LUX_PHASE2_THRESHOLD = 50
 class EdgeAIWateringController:
     """
     Unified Phase-Aware Controller.
-    - phase=0 (auto): tự nhận diện qua lux >= lux_phase2_threshold
-    - phase=1 (force): Phase 1 hộp kín
-    - phase=2 (force): Phase 2 có đèn
+    - Phase chính được lấy từ JSON ESP32: raw["phase"].
+    - Nếu ESP32 chưa gửi phase, dùng phase trong config nếu là 1/2.
+    - Nếu vẫn không có, mặc định Phase 1 để tránh nhảy Phase 2 do lux lọt sáng.
     """
 
     def __init__(
@@ -178,14 +177,21 @@ class EdgeAIWateringController:
 
     # ── Phase detection ───────────────────────────────────────────────────────
 
-    def detect_phase(self, lux: float) -> int:
+    def resolve_phase(self, esp_phase=None) -> int:
+        """Ưu tiên phase do ESP32 tính bằng RTC. Không tự chuyển phase bằng lux."""
+        try:
+            phase = int(esp_phase) if esp_phase is not None else None
+        except Exception:
+            phase = None
+        if phase in (1, 2):
+            return phase
         if self._phase_override in (1, 2):
             return self._phase_override
-        return 2 if (lux or 0) >= self.lux_phase2_threshold else 1
+        return 1
 
     # ── Validation ────────────────────────────────────────────────────────────
 
-    def validate(self, temperature, air_humidity, lux, soil_moisture) -> list:
+    def validate(self, temperature, air_humidity, lux, soil_moisture, phase=None) -> list:
         errors = []
         if temperature is None or not (0 <= temperature <= 60):
             errors.append("temperature_out_of_range")
@@ -193,7 +199,7 @@ class EdgeAIWateringController:
             errors.append("air_humidity_out_of_range")
         if soil_moisture is None or not (0 <= soil_moisture <= 100):
             errors.append("soil_moisture_out_of_range")
-        max_lux = 5000 if self.detect_phase(lux or 0) == 1 else 120000
+        max_lux = 5000 if self.resolve_phase(phase) == 1 else 120000
         if lux is None or not (0 <= lux <= max_lux):
             errors.append("lux_out_of_range")
         return errors
@@ -246,18 +252,17 @@ class EdgeAIWateringController:
 
     # ── Decision ─────────────────────────────────────────────────────────────
 
-    def decide(self, temperature, air_humidity, lux, soil_moisture) -> dict:
-        errors = self.validate(temperature, air_humidity, lux, soil_moisture)
+    def decide(self, temperature, air_humidity, lux, soil_moisture, phase=None) -> dict:
+        phase = self.resolve_phase(phase)
+        errors = self.validate(temperature, air_humidity, lux, soil_moisture, phase)
         if errors:
             return {
                 "status": "ERROR", "source": "validation",
                 "errors": errors,  "need_watering": None,
                 "confidence": 0.0, "action": "NO_ACTION",
                 "reason": "invalid_sensor_data",
-                "phase": self.detect_phase(lux or 0),
+                "phase": phase,
             }
-
-        phase = self.detect_phase(lux)
 
         # Safety rule: đất cực khô
         if soil_moisture <= self.soil_force_on:
@@ -356,13 +361,13 @@ class EdgeAIWateringController:
 
     def create_payload(
         self, temperature, air_humidity, lux, soil_moisture,
-        step=None, node_id=NODE_ID,
+        step=None, node_id=NODE_ID, phase=None,
         light_state="OFF", light_mode="AUTO_RTC", light_reason=None
     ) -> dict:
-        decision = self.decide(temperature, air_humidity, lux, soil_moisture)
+        decision = self.decide(temperature, air_humidity, lux, soil_moisture, phase)
         pump_state, ctrl_reason = self.update_pump_state(decision, soil_moisture)
         self._last_soil = float(soil_moisture)
-        phase = decision.get("phase", self.detect_phase(lux))
+        phase = decision.get("phase", self.resolve_phase(phase))
 
         return {
             "node_id":   node_id,
@@ -502,8 +507,7 @@ def parse_sensor(raw: dict) -> dict:
     light_mode  = status.get("light_mode", "AUTO_RTC")
     light_reason = status.get("light_reason", None)
 
-    # ESP32 phase feedback sau khi nhận cmd/phase từ BBB.
-    # Nếu không có hoặc sai, gateway vẫn tự tính phase bằng controller.
+    # Phase do ESP32 tự tính bằng RTC. Nếu thiếu/sai, gateway sẽ fallback Phase 1/config.
     try:
         esp_phase = int(raw.get("phase")) if raw.get("phase") is not None else None
         if esp_phase not in (1, 2):
@@ -517,7 +521,9 @@ def parse_sensor(raw: dict) -> dict:
         "lux":          lux,
         "soil_avg":     soil_avg,
         "soil_s1": s1, "soil_s2": s2, "soil_s3": s3, "soil_s4": s4,
-        "esp_phase":    esp_phase,
+        "phase":        esp_phase,
+        "phase_source": raw.get("phase_source", "MISSING"),
+        "days_after_planting": float(raw.get("days_after_planting", -1.0) or -1.0),
         "light_state":  light_state,
         "light_mode":   light_mode,
         "light_reason": light_reason,
@@ -558,6 +564,7 @@ def push_influx(write_api, payload: dict, log):
             .tag("phase",      str(payload.get("phase", 1)))
             .tag("ai_source",  ai.get("source", "unknown"))
             .tag("pump_state", ctrl["pump"]["state"])
+            .tag("phase_source", str(payload.get("phase_source", "unknown")))
             # Sensor
             .field("temperature",    float(s.get("temperature",   0)))
             .field("air_humidity",   float(s.get("air_humidity",  0)))
@@ -578,7 +585,8 @@ def push_influx(write_api, payload: dict, log):
             .field("step",      int(payload.get("step") or 0))
             .field("uptime_s",  int(payload.get("uptime_s",  0)))
             .field("wifi_rssi", int(payload.get("wifi_rssi", 0)))
-            .time(datetime.now(timezone.utc), WritePrecision.SECONDS)
+            .field("days_after_planting", float(payload.get("days_after_planting", -1.0)))
+            .time(datetime.now(timezone.utc), WritePrecision.S)
         )
         write_api.write(bucket=INFLUX_BUCKET, record=point)
         log.debug(f"[InfluxDB] ✓ step={payload.get('step')}")
@@ -613,6 +621,9 @@ def process(mqtt_client, controller, write_api, raw: dict, log):
     air_humidity = s["air_humidity"]
     lux          = s["lux"]
     soil_avg     = s["soil_avg"]
+    esp_phase    = s.get("phase")
+    phase_source = s.get("phase_source", "MISSING")
+    days_after_planting = s.get("days_after_planting", -1.0)
 
     # ── AI decision ───────────────────────────────────────────────────────────
     try:
@@ -623,6 +634,7 @@ def process(mqtt_client, controller, write_api, raw: dict, log):
             soil_moisture = soil_avg,
             step          = step,
             node_id       = NODE_ID,
+            phase         = esp_phase,
             light_state   = s["light_state"],
             light_mode    = s["light_mode"],
             light_reason  = s.get("light_reason"),
@@ -632,7 +644,6 @@ def process(mqtt_client, controller, write_api, raw: dict, log):
         return
 
     phase       = payload["phase"]
-    esp_phase   = s.get("esp_phase")
     pump_state  = payload["control"]["pump"]["state"]
     pump_reason = payload["control"]["pump"]["reason"]
     ai_source   = payload["ai"]["source"]
@@ -642,6 +653,8 @@ def process(mqtt_client, controller, write_api, raw: dict, log):
     alerts = build_alerts(temperature, air_humidity,
                           lux, soil_avg, phase)
     payload["alert"]     = "; ".join(alerts) if alerts else None
+    payload["phase_source"] = phase_source
+    payload["days_after_planting"] = days_after_planting
     payload["uptime_s"]  = s["uptime_s"]
     payload["wifi_rssi"] = s["wifi_rssi"]
 
@@ -653,14 +666,12 @@ def process(mqtt_client, controller, write_api, raw: dict, log):
 
     # ── Log ───────────────────────────────────────────────────────────────────
     log.info("─" * 62)
-    log.info(f"  Step {step:4d} | Phase {phase} | "
-             f"{payload['timestamp'][:19]}")
+    log.info(f"  Step {step:4d} | Phase {phase} ({phase_source}) | "
+             f"days={days_after_planting:.2f} | {payload['timestamp'][:19]}")
     log.info(f"  T={temperature:.1f}°C  RH={air_humidity:.1f}%  "
              f"Lux={lux:.1f}  Soil={soil_avg:.1f}%")
     log.info(f"  AI [{ai_source}] → Pump {pump_state} "
              f"({pump_reason}) conf={confidence:.0%}")
-    if esp_phase is not None and esp_phase != phase:
-        log.warning(f"  ⚠️  ESP32 phase={esp_phase} khác BBB phase={phase}; sẽ đồng bộ lại qua cmd/phase")
     for alert in alerts:
         log.warning(f"  ⚠️  {alert}")
 
@@ -671,14 +682,7 @@ def process(mqtt_client, controller, write_api, raw: dict, log):
     else:
         log.error(f"  → cmd/pump FAILED rc={ret.rc}")
 
-    # ── Publish cmd/phase xuống ESP32 ─────────────────────────────────────────
-    # ESP32 dùng phase + RTC DS3231 để tự bật/tắt đèn.
-    # Không publish cmd/light trong luồng AUTO để tránh BBB và ESP32 tranh quyền đèn.
-    ret = mqtt_client.publish(TOPIC_CMD_PHASE, str(phase), qos=MQTT_QOS, retain=True)
-    if ret.rc == mqtt.MQTT_ERR_SUCCESS:
-        log.info(f"  → {TOPIC_CMD_PHASE}: {phase} (retain)")
-    else:
-        log.error(f"  → cmd/phase FAILED rc={ret.rc}")
+    # ESP32 là nguồn phase/đèn bằng RTC, gateway không publish cmd/phase/cmd/light trong AUTO.
 
     # ── Ghi InfluxDB (thread riêng, không block MQTT loop) ───────────────────
     threading.Thread(
