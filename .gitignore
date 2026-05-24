@@ -1,1 +1,3 @@
 esp/build 
+BBB/env/
+BBB/*.log
