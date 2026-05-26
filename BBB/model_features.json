@@ -1,6 +1,7 @@
 [
-  "temperature",
-  "air_humidity",
-  "lux",
-  "soil_moisture"
+    "temperature",
+    "air_humidity",
+    "lux",
+    "soil_moisture",
+    "phase"
 ]
