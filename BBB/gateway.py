@@ -5,8 +5,8 @@ Rau Cải Mầm (Brassica juncea) | BRASSICA_JUNCEA_01
 
 File duy nhất chạy trên BeagleBone Black — tích hợp đầy đủ:
   • EdgeAIWateringController (Phase 1/2 lấy từ ESP32 RTC)
-  • MQTT subscriber (nhận sensor từ ESP32)
-  • MQTT publisher  (gửi cmd/pump xuống ESP32; đèn/phase do ESP32 RTC tự xử lý)
+  • MQTT subscriber (nhận sensor từ ESP32, actuator/state, và quan sát lệnh Digital Twin)
+  • MQTT publisher  (gửi cmd/pump xuống ESP32 trong AUTO; đèn/phase do ESP32 RTC tự xử lý)
   • InfluxDB Cloud writer
   • Alert engine theo ngưỡng Brassica juncea
   • Graceful shutdown + auto-reconnect + retry
@@ -65,10 +65,19 @@ MQTT_CLIENT_ID = "bbb_gateway_brassica_01"
 MQTT_KEEPALIVE = 60
 MQTT_QOS       = 1
 
-TOPIC_SENSOR    = "cps/greenhouse/sensors"
-TOPIC_CMD_PUMP  = "cps/greenhouse/cmd/pump"
-TOPIC_CMD_LIGHT = "cps/greenhouse/cmd/light"   # legacy/manual only, hiện không publish trong AUTO
-TOPIC_STATUS    = "cps/greenhouse/status"
+# ESP32 -> BBB / Digital Twin
+TOPIC_SENSOR         = "cps/greenhouse/sensors"
+TOPIC_STATUS         = "cps/greenhouse/status"
+TOPIC_ACTUATOR_STATE = "cps/greenhouse/actuator/state"
+
+# BBB -> ESP32: luồng điều khiển chính
+TOPIC_CMD_PUMP       = "cps/greenhouse/cmd/pump"
+TOPIC_CMD_LIGHT      = "cps/greenhouse/cmd/light"   # legacy/manual only, hiện không publish trong AUTO
+
+# Digital Twin -> ESP32: điều khiển trực tiếp
+# BBB chỉ subscribe để quan sát/log và tạm nhường quyền AI trong thời gian DIRECT.
+TOPIC_DT_CMD_PUMP    = "cps/greenhouse/dt/cmd/pump"
+TOPIC_DT_CMD_LIGHT   = "cps/greenhouse/dt/cmd/light"
 
 # ── InfluxDB Cloud ───────────────────────────────────────────────────────────
 INFLUX_URL    = "https://us-east-1-1.aws.cloud2.influxdata.com"
@@ -637,6 +646,148 @@ def push_influx(write_api, payload: dict, log):
         log.error(f"[InfluxDB] ✗ Lỗi ghi: {e}")
 
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DIGITAL TWIN DIRECT OBSERVER
+# ══════════════════════════════════════════════════════════════════════════════
+
+_dt_lock = threading.Lock()
+_dt_direct_until = {
+    "pump": 0.0,
+    "light": 0.0,
+}
+_last_dt_cmd = {
+    "pump": None,
+    "light": None,
+}
+_last_actuator_state = {
+    "pump": {"state": "UNKNOWN", "mode": "UNKNOWN", "reason": None},
+    "light": {"state": "UNKNOWN", "mode": "UNKNOWN", "reason": None},
+}
+
+
+def _safe_json_loads(payload: bytes):
+    try:
+        return json.loads(payload.decode("utf-8"))
+    except Exception:
+        return None
+
+
+def _as_state(value) -> str:
+    s = str(value or "").strip().upper()
+    if s in ("1", "TRUE", "ON", "PUMP_ON", "LIGHT_ON"):
+        return "ON"
+    if s in ("0", "FALSE", "OFF", "PUMP_OFF", "LIGHT_OFF"):
+        return "OFF"
+    return s or "UNKNOWN"
+
+
+def _clamp_duration_s(value, default_s=10, max_s=1800) -> int:
+    try:
+        duration = int(float(value))
+    except Exception:
+        duration = default_s
+    if duration < 0:
+        duration = 0
+    if duration > max_s:
+        duration = max_s
+    return duration
+
+
+def handle_dt_direct_command(topic: str, raw: dict, log):
+    """BBB chỉ quan sát lệnh Digital Twin trực tiếp.
+
+    Digital Twin publish trực tiếp tới ESP32:
+      - cps/greenhouse/dt/cmd/pump
+      - cps/greenhouse/dt/cmd/light
+
+    BBB subscribe các topic này để:
+      1. log/debug lệnh manual/direct,
+      2. tạm nhường quyền AI pump trong thời gian direct,
+      3. không forward lại lệnh, tránh loop điều khiển.
+    """
+    target = "pump" if topic == TOPIC_DT_CMD_PUMP else "light"
+    state = _as_state(raw.get("state", raw.get("cmd", raw.get("action", "UNKNOWN"))))
+    source = raw.get("source", "digital_twin")
+    reason = raw.get("reason", "dt_direct")
+    max_s = 15 if target == "pump" else 1800
+    duration_s = _clamp_duration_s(raw.get("duration_s", raw.get("duration", 0)),
+                                   default_s=(10 if target == "pump" else 300),
+                                   max_s=max_s)
+
+    now = time.time()
+    with _dt_lock:
+        _last_dt_cmd[target] = {
+            "topic": topic,
+            "source": source,
+            "state": state,
+            "duration_s": duration_s,
+            "reason": reason,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+        # Nếu Digital Twin bật trực tiếp, BBB nhường quyền AI trong duration + margin.
+        # Nếu OFF, nhường ngắn để ESP32 xử lý xong rồi quay lại AUTO.
+        if state == "ON":
+            _dt_direct_until[target] = now + duration_s + 2
+        elif state == "OFF":
+            _dt_direct_until[target] = max(_dt_direct_until.get(target, 0.0), now + 2)
+
+    log.warning(
+        f"[DT_DIRECT] observed target={target} state={state} "
+        f"duration={duration_s}s source={source} reason={reason}. "
+        f"Gateway không forward, chỉ tạm nhường quyền AUTO nếu cần."
+    )
+
+
+def is_dt_direct_active(target: str) -> bool:
+    with _dt_lock:
+        return time.time() < float(_dt_direct_until.get(target, 0.0))
+
+
+def handle_actuator_state(raw: dict, log):
+    """Nhận trạng thái relay thực tế do ESP32 publish."""
+    with _dt_lock:
+        # Hỗ trợ nhiều dạng payload khác nhau từ ESP32.
+        pump_obj = raw.get("pump", {})
+        light_obj = raw.get("light", {})
+
+        if isinstance(pump_obj, dict):
+            pump_state = _as_state(pump_obj.get("state", raw.get("pump_state", raw.get("pump"))))
+            pump_mode = pump_obj.get("mode", raw.get("pump_mode", "UNKNOWN"))
+            pump_reason = pump_obj.get("reason", raw.get("pump_reason"))
+        else:
+            pump_state = _as_state(pump_obj)
+            pump_mode = raw.get("pump_mode", "UNKNOWN")
+            pump_reason = raw.get("pump_reason")
+
+        if isinstance(light_obj, dict):
+            light_state = _as_state(light_obj.get("state", raw.get("light_state", raw.get("light"))))
+            light_mode = light_obj.get("mode", raw.get("light_mode", "UNKNOWN"))
+            light_reason = light_obj.get("reason", raw.get("light_reason"))
+        else:
+            light_state = _as_state(light_obj)
+            light_mode = raw.get("light_mode", "UNKNOWN")
+            light_reason = raw.get("light_reason")
+
+        _last_actuator_state["pump"] = {
+            "state": pump_state, "mode": pump_mode, "reason": pump_reason,
+        }
+        _last_actuator_state["light"] = {
+            "state": light_state, "mode": light_mode, "reason": light_reason,
+        }
+
+    log.info(
+        f"[ACTUATOR_STATE] pump={pump_state}/{pump_mode} "
+        f"light={light_state}/{light_mode}"
+    )
+
+
+def get_cached_actuator_state() -> dict:
+    with _dt_lock:
+        return json.loads(json.dumps(_last_actuator_state))
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # CORE PROCESSOR
 # ══════════════════════════════════════════════════════════════════════════════
@@ -704,6 +855,7 @@ def process(mqtt_client, controller, write_api, raw: dict, log):
     payload["gw_step"] = gw_step
     payload["uptime_s"]  = s["uptime_s"]
     payload["wifi_rssi"] = s["wifi_rssi"]
+    payload["actuator_actual"] = get_cached_actuator_state()
 
     # Bổ sung soil channels cho InfluxDB
     payload["sensor"].update({
@@ -723,13 +875,20 @@ def process(mqtt_client, controller, write_api, raw: dict, log):
         log.warning(f"  ⚠️  {alert}")
 
     # ── Publish cmd/pump xuống ESP32 ──────────────────────────────────────────
-    ret = mqtt_client.publish(TOPIC_CMD_PUMP, pump_state, qos=MQTT_QOS)
-    if ret.rc == mqtt.MQTT_ERR_SUCCESS:
-        log.info(f"  → {TOPIC_CMD_PUMP}: {pump_state}")
+    # Nếu Digital Twin đang tác động trực tiếp bơm, BBB tạm không gửi lệnh AI
+    # để tránh vừa bật trực tiếp đã bị AUTO gửi OFF.
+    if is_dt_direct_active("pump"):
+        log.warning(f"  → SKIP {TOPIC_CMD_PUMP}: DT_DIRECT pump đang active, BBB nhường quyền tạm thời")
     else:
-        log.error(f"  → cmd/pump FAILED rc={ret.rc}")
+        ret = mqtt_client.publish(TOPIC_CMD_PUMP, pump_state, qos=MQTT_QOS)
+        if ret.rc == mqtt.MQTT_ERR_SUCCESS:
+            log.info(f"  → {TOPIC_CMD_PUMP}: {pump_state}")
+        else:
+            log.error(f"  → cmd/pump FAILED rc={ret.rc}")
 
-    # ESP32 là nguồn phase/đèn bằng RTC, gateway không publish cmd/phase/cmd/light trong AUTO.
+    # ESP32 là nguồn phase/đèn bằng RTC.
+    # Digital Twin tác động trực tiếp qua cps/greenhouse/dt/cmd/... tới ESP32.
+    # Gateway chỉ quan sát các lệnh đó, không forward lại.
 
     # ── Ghi InfluxDB (thread riêng, không block MQTT loop) ───────────────────
     threading.Thread(
@@ -749,8 +908,14 @@ def make_callbacks(controller, write_api, log):
         codes = {0:"OK", 1:"Protocol", 2:"Client ID",
                  3:"Unavailable", 4:"Credentials", 5:"Unauthorized"}
         if rc == 0:
-            log.info(f"✅ MQTT connected → subscribe {TOPIC_SENSOR}; pump control only")
+            log.info(
+                f"✅ MQTT connected → subscribe sensor/actuator/dt-direct; "
+                f"BBB AUTO chỉ publish {TOPIC_CMD_PUMP}"
+            )
             client.subscribe(TOPIC_SENSOR, qos=MQTT_QOS)
+            client.subscribe(TOPIC_ACTUATOR_STATE, qos=MQTT_QOS)
+            client.subscribe(TOPIC_DT_CMD_PUMP, qos=MQTT_QOS)
+            client.subscribe(TOPIC_DT_CMD_LIGHT, qos=MQTT_QOS)
             client.publish(TOPIC_STATUS, json.dumps({
                 "node_id":    NODE_ID,
                 "gateway":    "BBB",
@@ -770,11 +935,20 @@ def make_callbacks(controller, write_api, log):
     def on_message(client, userdata, msg):
         try:
             raw = json.loads(msg.payload.decode("utf-8"))
-            process(client, controller, write_api, raw, log)
+
+            if msg.topic == TOPIC_SENSOR:
+                process(client, controller, write_api, raw, log)
+            elif msg.topic == TOPIC_ACTUATOR_STATE:
+                handle_actuator_state(raw, log)
+            elif msg.topic in (TOPIC_DT_CMD_PUMP, TOPIC_DT_CMD_LIGHT):
+                handle_dt_direct_command(msg.topic, raw, log)
+            else:
+                log.debug(f"[MQTT] Bỏ qua topic={msg.topic}: {str(raw)[:120]}")
+
         except json.JSONDecodeError:
-            log.error(f"[MQTT] Payload không phải JSON: {msg.payload[:100]}")
+            log.error(f"[MQTT] Payload không phải JSON topic={msg.topic}: {msg.payload[:100]}")
         except Exception as e:
-            log.error(f"[MQTT] on_message lỗi: {e}", exc_info=True)
+            log.error(f"[MQTT] on_message lỗi topic={msg.topic}: {e}", exc_info=True)
 
     def on_publish(client, userdata, mid):
         log.debug(f"[MQTT] ACK mid={mid}")
@@ -840,7 +1014,7 @@ def main():
     log.info(f"  Node    : {NODE_ID}")
     log.info(f"  Model   : {args.model}")
     log.info(f"  Config  : {args.config}")
-    log.info(f"  MQTT    : {args.broker}:{args.port} → {TOPIC_SENSOR}")
+    log.info(f"  MQTT    : {args.broker}:{args.port} → sensor + actuator/state + dt/cmd")
     log.info(f"  InfluxDB: {INFLUX_URL}")
     log.info("═" * 62)
 
