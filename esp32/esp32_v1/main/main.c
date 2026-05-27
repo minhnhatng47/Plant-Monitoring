@@ -10,12 +10,15 @@
  * - Resilience: Ring buffer 64 packets để lưu offline và tự động drain khi WiFi phục hồi.
  * - Phase owner: ESP32 đọc DS3231 RTC, tự tính Phase 1/2 theo planting_start_time,
  *   tự điều khiển đèn theo phase và gửi phase lên BBB.
+ * - Time sync: WiFi có mạng -> NTP -> cập nhật DS3231 nếu lệch > 5 giây.
  */
 
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 #include <stdlib.h>
 #include <time.h>
+#include <sys/time.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -27,9 +30,11 @@
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_netif.h"
+#include "esp_sntp.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "nvs_flash.h"
+#include "nvs.h"
 #include "driver/i2c_master.h"
 #include "driver/gpio.h"
 #include "mqtt_client.h"
@@ -39,6 +44,11 @@
 #include "bh1750.h"
 #include "esp32-dht11.h"
 #include "ds3231.h"
+
+/* Compatibility: một số ESP-IDF dùng SNTP_OPMODE_POLL thay vì ESP_SNTP_OPMODE_POLL. */
+#ifndef ESP_SNTP_OPMODE_POLL
+#define ESP_SNTP_OPMODE_POLL SNTP_OPMODE_POLL
+#endif
 
 /* ================================================================
    CẤU HÌNH HỆ THỐNG WIIFI DẠNG MẢNG (MULTI-WIFI)
@@ -74,18 +84,26 @@ static const wifi_cred_t WIFI_NETWORKS[] = {
 
 #define NODE_ID              "BRASSICA_JUNCEA_01"
 #define PLANT_NAME           "Rau Cải Mầm (Brassica juncea)"
-#define FW_VERSION           "2.3.0-rtc-phase"
+#define FW_VERSION           "2.6.0-rtc-nvs-phase-dt-direct"
 
 /* MQTT */
-#define MQTT_BROKER_URI      "mqtt://192.168.100.120"  /* IP hiện tại của BBB/Mosquitto */
+#define MQTT_BROKER_URI      "mqtt://192.168.2.14"  /* IP hiện tại của BBB/Mosquitto */
 #define MQTT_PORT            1883
 #define MQTT_KEEPALIVE_S     60
 #define MQTT_QOS             1
 
 #define TOPIC_SENSOR         "cps/greenhouse/sensors"
 #define TOPIC_STATUS         "cps/greenhouse/status"
+#define TOPIC_ACTUATOR_STATE "cps/greenhouse/actuator/state"
+
+/* BBB -> ESP32: luồng AUTO chính */
 #define TOPIC_CMD_PUMP       "cps/greenhouse/cmd/pump"
-#define TOPIC_CMD_LIGHT      "cps/greenhouse/cmd/light"      /* legacy/manual, hiện chưa dùng */
+#define TOPIC_CMD_LIGHT      "cps/greenhouse/cmd/light"      /* legacy/manual */
+#define TOPIC_CMD_PLANTING_START "cps/greenhouse/cmd/planting_start"
+
+/* BBB Influx Bridge -> ESP32: Digital Twin direct command */
+#define TOPIC_DT_CMD_PUMP    "cps/greenhouse/dt/cmd/pump"
+#define TOPIC_DT_CMD_LIGHT   "cps/greenhouse/dt/cmd/light"
 
 /* GPIO & HW MUX */
 #define I2C_MASTER_SDA       21
@@ -93,8 +111,8 @@ static const wifi_cred_t WIFI_NETWORKS[] = {
 #define I2C_MASTER_PORT      I2C_NUM_0
 
 #define DHT11_GPIO           16
-#define RELAY_PUMP_GPIO      26      /* Active HIGH */
-#define RELAY_LIGHT_GPIO     27      /* Active HIGH */
+#define RELAY_PUMP_GPIO      19      /* Active HIGH */
+#define RELAY_LIGHT_GPIO     18      /* Active HIGH */
 
 /* ADS1115 Configuration */
 #define ADS1115_I2C_ADDR     ADS111X_ADDR_GND   /* 0x48 */
@@ -119,7 +137,7 @@ static const ads111x_mux_t SOIL_MUX[SOIL_CH_COUNT] = {
 #define HUM_PHASE2_MAX       65.0f
 #define SOIL_IDEAL_MIN       55.0f
 #define SOIL_IDEAL_MAX       80.0f
-#define LIGHT_LEAK_THRESHOLD 5.0f    /* lux -- Phase 1 hộp kín, >5 lux = lọt sáng */
+#define LIGHT_LEAK_THRESHOLD 150.0f  /* lux -- Phase 1 hộp xốp, không tối tuyệt đối */
 #define LIGHT_PHASE2_MIN     150.0f  /* lux -- Đèn LED tối thiểu Phase 2 */
 #define LIGHT_PHASE2_IDEAL   220.0f  /* lux -- Đèn LED tối ưu */
 
@@ -128,27 +146,52 @@ static const ads111x_mux_t SOIL_MUX[SOIL_CH_COUNT] = {
 #define MQTT_PUBLISH_MS      5000
 #define LIGHT_CTRL_MS        1000   /* Chu kỳ kiểm tra lịch đèn theo RTC */
 
+/* NTP -> DS3231 RTC sync
+ * DS3231 đang được dùng như đồng hồ local UTC+7 cho phase/light schedule.
+ * Khi WiFi có Internet, ESP32 lấy giờ NTP, đổi sang UTC+7 rồi ghi vào DS3231 nếu sai lệch > 5s.
+ */
+#define NTP_SERVER_1              "pool.ntp.org"
+#define NTP_SERVER_2              "time.google.com"
+#define TZ_INFO_UTC7              "ICT-7"
+#define NTP_SYNC_TIMEOUT_MS       30000
+#define RTC_NTP_MAX_DRIFT_S       5
+#define RTC_NTP_RETRY_MS          (10 * 60 * 1000)
+#define RTC_NTP_SYNC_PERIOD_MS    (24 * 60 * 60 * 1000)
+
 /* Local debug logs: hữu ích khi BBB/gateway chưa bật */
 #define SENSOR_LOG_EVERY_N        1    /* 1 = log mỗi gói sensor, tương ứng ~5s */
 #define LIGHT_LOG_HEARTBEAT_S     30   /* log trạng thái đèn mỗi 30s nếu không đổi */
 #define OFFLINE_LOG_EVERY_N       5    /* khi MQTT mất, log buffer mỗi 5 packet */
 #define DRAIN_MAX_PER_CYCLE       5    /* số packet offline đẩy lại mỗi chu kỳ publish */
 
+/* Digital Twin direct safety timeout */
+#define DT_PUMP_DEFAULT_DURATION_S   10
+#define DT_PUMP_MAX_DURATION_S       15
+#define DT_LIGHT_DEFAULT_DURATION_S  300
+#define DT_LIGHT_MAX_DURATION_S      1800
+#define ACTUATOR_STATE_PUBLISH_MS    5000
+
 /* Phase & Light Schedule */
 #define PHASE_1_DARK         1
 #define PHASE_2_LIGHT        2
 #define DEFAULT_PHASE        PHASE_1_DARK
 
-/* Mốc gieo/trồng để ESP32 tự tính phase bằng RTC DS3231.
- * Sửa các giá trị này theo thời điểm bắt đầu mẻ rau cải mầm.
+/* Phase start policy
+ * - Phase 0 ngâm hạt nằm ngoài firmware.
+ * - planting_start_epoch = thời điểm đã gieo hạt vào đất.
+ * - Lần đầu boot: sau khi kiểm tra RTC/NTP, nếu NVS chưa có mốc thì lưu RTC hiện tại vào NVS.
+ * - Reset/mất điện/flash thường: NVS còn, không reset mốc.
+ * - Bắt đầu lứa mới: gửi MQTT TOPIC_CMD_PLANTING_START action=SET_NOW/SET_EPOCH/CLEAR.
  */
-#define PLANTING_START_YEAR  2026
-#define PLANTING_START_MONTH 5
-#define PLANTING_START_DAY   24
-#define PLANTING_START_HOUR  8
-#define PLANTING_START_MIN   0
-#define PLANTING_START_SEC   0
-#define DARK_PHASE_DAYS      3.0f
+#define DARK_PHASE_DAYS      2.0f
+#define NVS_NS_PLANTING     "planting"
+#define NVS_KEY_START_EPOCH "start_epoch"
+#define NVS_KEY_LAST_CMD_ID "last_cmd"
+#define PLANTING_CMD_ID_MAX 64
+
+/* Task core pinning */
+#define CORE_NET            0
+#define CORE_APP            1
 
 #define LIGHT_ON_HOUR_UTC7   6
 #define LIGHT_OFF_HOUR_UTC7  20
@@ -178,9 +221,16 @@ static int s_wifi_retry_count   = 0;
 /* Các biến logic */
 static int  s_step           = 0;
 static int  s_current_phase  = DEFAULT_PHASE;   /* phase ESP32 tự tính từ RTC; dùng làm fallback nếu RTC lỗi */
+static int64_t s_pump_direct_until_us  = 0;     /* Digital Twin direct pump hold-off */
+static int64_t s_light_direct_until_us = 0;     /* Digital Twin direct light hold-off */
 static SemaphoreHandle_t s_sensor_mutex;
+static SemaphoreHandle_t s_i2c_mutex;
 static i2c_dev_t         s_ads_dev = {0};
 static i2c_dev_t         s_rtc_dev = {0};
+static bool              s_sntp_started = false;
+static time_t            s_planting_start_epoch = 0;
+static bool              s_planting_start_valid = false;
+static char              s_last_planting_cmd_id[PLANTING_CMD_ID_MAX] = {0};
 
 /**
  * @brief Cấu trúc bản ghi chứa toàn bộ dữ liệu Snapshot từ cảm biến
@@ -195,8 +245,10 @@ typedef struct {
     int   phase;
     float days_after_planting;
     char  phase_source[24];    /* ESP32_RTC / RTC_ERROR */
-    char  light_mode[16];      /* AUTO_RTC */
-    char  light_reason[24];    /* PHASE1_DARK / PHASE2_SCHEDULE */
+    char  pump_mode[24];       /* AI_AUTO / DIRECT_DT */
+    char  pump_reason[32];     /* BBB_AI_AUTO / DT_DIRECT / DIRECT_TIMEOUT_OFF */
+    char  light_mode[24];      /* AUTO_RTC / DIRECT_DT / LEGACY_CMD */
+    char  light_reason[32];    /* PHASE1_LOW_LIGHT / PHASE2_DAYLIGHT_SIM / DT_DIRECT */
     bool  dht11_ok;
     bool  bh1750_ok;
     bool  ads1115_ok;
@@ -213,7 +265,7 @@ static sensor_data_t g_sensor = {0};
    ================================================================ */
 
 #define RING_BUF_SIZE        64     /* Số packet tối đa lưu khi offline */
-#define JSON_MAX_LEN         768
+#define JSON_MAX_LEN         1024
 
 typedef struct {
     char  json[JSON_MAX_LEN];
@@ -327,22 +379,297 @@ static void dht11_moving_avg(float t, float h, float *out_t, float *out_h) {
    HELPER - RTC & CẢM BIẾN
    ================================================================ */
 
+static bool i2c_take(uint32_t timeout_ms) {
+    if (!s_i2c_mutex) return true;
+    return xSemaphoreTake(s_i2c_mutex, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
+}
+
+static void i2c_give(void) {
+    if (s_i2c_mutex) xSemaphoreGive(s_i2c_mutex);
+}
+
+static bool rtc_get_time_safe(struct tm *out) {
+    if (!out) return false;
+    bool ok = false;
+    if (i2c_take(2500)) {
+        ok = (ds3231_get_time(&s_rtc_dev, out) == ESP_OK);
+        i2c_give();
+    }
+    return ok;
+}
+
+static bool rtc_set_time_safe(const struct tm *in) {
+    if (!in) return false;
+    struct tm tmp = *in;
+    bool ok = false;
+    if (i2c_take(2500)) {
+        ok = (ds3231_set_time(&s_rtc_dev, &tmp) == ESP_OK);
+        i2c_give();
+    }
+    return ok;
+}
+
+static time_t tm_local_to_epoch(struct tm t) {
+    t.tm_isdst = -1;
+    return mktime(&t);
+}
+
+static bool rtc_get_epoch_from_ds3231(time_t *epoch_out) {
+    struct tm t = {0};
+    if (!rtc_get_time_safe(&t) || t.tm_year <= 100) return false;
+    time_t e = tm_local_to_epoch(t);
+    if (e <= 0) return false;
+    if (epoch_out) *epoch_out = e;
+    return true;
+}
+
+static void epoch_to_local_tm(time_t epoch, struct tm *out) {
+    localtime_r(&epoch, out);
+}
+
+static void epoch_to_iso_utc7(time_t epoch, char *buf, size_t len) {
+    if (!buf || len == 0) return;
+    if (epoch <= 0) {
+        strlcpy(buf, "INVALID", len);
+        return;
+    }
+    struct tm t = {0};
+    epoch_to_local_tm(epoch, &t);
+    strftime(buf, len, "%Y-%m-%dT%H:%M:%S+07:00", &t);
+}
+
+static bool planting_start_load_from_nvs(void) {
+    nvs_handle_t h;
+    int64_t epoch = 0;
+    esp_err_t err = nvs_open(NVS_NS_PLANTING, NVS_READONLY, &h);
+    if (err != ESP_OK) return false;
+
+    err = nvs_get_i64(h, NVS_KEY_START_EPOCH, &epoch);
+
+    size_t cmd_len = sizeof(s_last_planting_cmd_id);
+    if (nvs_get_str(h, NVS_KEY_LAST_CMD_ID, s_last_planting_cmd_id, &cmd_len) != ESP_OK) {
+        s_last_planting_cmd_id[0] = '\0';
+    }
+
+    nvs_close(h);
+
+    if (err == ESP_OK && epoch > 0) {
+        s_planting_start_epoch = (time_t)epoch;
+        s_planting_start_valid = true;
+        char iso[32];
+        epoch_to_iso_utc7(s_planting_start_epoch, iso, sizeof(iso));
+        ESP_LOGI(TAG, "PLANTING: load NVS start_epoch=%lld (%s), last_cmd=%s",
+                 (long long)s_planting_start_epoch, iso,
+                 s_last_planting_cmd_id[0] ? s_last_planting_cmd_id : "NONE");
+        return true;
+    }
+
+    return false;
+}
+
+static bool planting_start_save_to_nvs(time_t epoch, const char *cmd_id) {
+    if (epoch <= 0) return false;
+
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NS_PLANTING, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "PLANTING: nvs_open write lỗi: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    err = nvs_set_i64(h, NVS_KEY_START_EPOCH, (int64_t)epoch);
+    if (err == ESP_OK && cmd_id && cmd_id[0]) {
+        err = nvs_set_str(h, NVS_KEY_LAST_CMD_ID, cmd_id);
+    }
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+
+    if (err == ESP_OK) {
+        s_planting_start_epoch = epoch;
+        s_planting_start_valid = true;
+        if (cmd_id && cmd_id[0]) strlcpy(s_last_planting_cmd_id, cmd_id, sizeof(s_last_planting_cmd_id));
+        char iso[32];
+        epoch_to_iso_utc7(epoch, iso, sizeof(iso));
+        ESP_LOGW(TAG, "PLANTING: save NVS start_epoch=%lld (%s), cmd_id=%s",
+                 (long long)epoch, iso, cmd_id && cmd_id[0] ? cmd_id : "BOOT_INIT");
+        return true;
+    }
+
+    ESP_LOGE(TAG, "PLANTING: save NVS lỗi: %s", esp_err_to_name(err));
+    return false;
+}
+
+static bool planting_start_clear_nvs(void) {
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NS_PLANTING, NVS_READWRITE, &h);
+    if (err != ESP_OK) return false;
+
+    nvs_erase_key(h, NVS_KEY_START_EPOCH);
+    nvs_erase_key(h, NVS_KEY_LAST_CMD_ID);
+    err = nvs_commit(h);
+    nvs_close(h);
+
+    s_planting_start_epoch = 0;
+    s_planting_start_valid = false;
+    s_last_planting_cmd_id[0] = '\0';
+
+    return err == ESP_OK;
+}
+
 static void rtc_sync_compile_time(void) {
     struct tm t = {0};
-    if (ds3231_get_time(&s_rtc_dev, &t) != ESP_OK) return;
+    if (!rtc_get_time_safe(&t)) return;
 
     if (t.tm_year <= 100) {   
         struct tm ct = {0};
         strptime(__DATE__ " " __TIME__, "%b %d %Y %H:%M:%S", &ct);
-        if (ds3231_set_time(&s_rtc_dev, &ct) == ESP_OK) {
+        if (rtc_set_time_safe(&ct)) {
             ESP_LOGW("RTC", "Đồng bộ RTC từ compile time: %s %s", __DATE__, __TIME__);
+        }
+    }
+}
+
+/**
+ * @brief Kiểm tra system time đã hợp lệ sau NTP chưa.
+ */
+static bool system_time_is_valid(void) {
+    time_t now = 0;
+    struct tm timeinfo = {0};
+    time(&now);
+    localtime_r(&now, &timeinfo);
+    return (timeinfo.tm_year >= (2024 - 1900));
+}
+
+/**
+ * @brief Khởi động SNTP một lần. Không gọi lại nhiều lần để tránh lỗi state.
+ */
+static void ntp_start_once(void) {
+    if (s_sntp_started) return;
+
+    setenv("TZ", TZ_INFO_UTC7, 1);
+    tzset();
+
+    ESP_LOGI("NTP", "SNTP init: server1=%s server2=%s timezone=%s", NTP_SERVER_1, NTP_SERVER_2, TZ_INFO_UTC7);
+    esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, NTP_SERVER_1);
+    esp_sntp_setservername(1, NTP_SERVER_2);
+    esp_sntp_init();
+
+    s_sntp_started = true;
+}
+
+/**
+ * @brief Chờ NTP cập nhật system time.
+ */
+static bool ntp_wait_time_valid(uint32_t timeout_ms) {
+    int waited_ms = 0;
+    while (waited_ms < (int)timeout_ms) {
+        if (system_time_is_valid()) {
+            time_t now = 0;
+            struct tm local = {0};
+            time(&now);
+            localtime_r(&now, &local);
+            ESP_LOGI("NTP", "System time valid: %04d-%02d-%02d %02d:%02d:%02d UTC+7",
+                     local.tm_year + 1900, local.tm_mon + 1, local.tm_mday,
+                     local.tm_hour, local.tm_min, local.tm_sec);
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(500));
+        waited_ms += 500;
+    }
+    ESP_LOGW("NTP", "Timeout chờ NTP sau %ums", timeout_ms);
+    return false;
+}
+
+/**
+ * @brief Đồng bộ DS3231 từ system time đã được NTP cập nhật.
+ * @return true nếu RTC đang đúng hoặc đã set thành công.
+ */
+static bool rtc_sync_from_ntp_if_needed(void) {
+    if (!system_time_is_valid()) {
+        ESP_LOGW("RTC", "Không sync DS3231: system time chưa hợp lệ");
+        return false;
+    }
+
+    time_t now = 0;
+    struct tm sys_local = {0};
+    time(&now);
+    localtime_r(&now, &sys_local);  /* UTC+7 do TZ_INFO_UTC7 */
+
+    struct tm rtc_time = {0};
+    bool rtc_read_ok = rtc_get_time_safe(&rtc_time);
+    if (!rtc_read_ok || rtc_time.tm_year <= 100) {
+        if (rtc_set_time_safe(&sys_local)) {
+            ESP_LOGW("RTC", "DS3231 invalid/lỗi đọc -> set từ NTP: %04d-%02d-%02d %02d:%02d:%02d UTC+7",
+                     sys_local.tm_year + 1900, sys_local.tm_mon + 1, sys_local.tm_mday,
+                     sys_local.tm_hour, sys_local.tm_min, sys_local.tm_sec);
+            return true;
+        }
+        ESP_LOGE("RTC", "Set DS3231 từ NTP thất bại");
+        return false;
+    }
+
+    time_t rtc_epoch = mktime(&rtc_time);
+    time_t sys_epoch = mktime(&sys_local);
+    double drift_s = difftime(sys_epoch, rtc_epoch);
+    if (drift_s < 0) drift_s = -drift_s;
+
+    if (drift_s > RTC_NTP_MAX_DRIFT_S) {
+        if (rtc_set_time_safe(&sys_local)) {
+            ESP_LOGW("RTC", "DS3231 lệch %.0fs > %ds -> đã sync từ NTP", drift_s, RTC_NTP_MAX_DRIFT_S);
+            return true;
+        }
+        ESP_LOGE("RTC", "DS3231 lệch %.0fs nhưng set_time thất bại", drift_s);
+        return false;
+    }
+
+    ESP_LOGI("RTC", "DS3231 OK, lệch %.0fs <= %ds, không cần ghi lại", drift_s, RTC_NTP_MAX_DRIFT_S);
+    return true;
+}
+
+/**
+ * @brief Task định kỳ đồng bộ NTP -> DS3231.
+ * - Chạy sau khi WiFi có IP.
+ * - Lần đầu sync ngay sau boot nếu có mạng.
+ * - Sau đó sync lại mỗi 24h để DS3231 không trôi giờ.
+ */
+static void ntp_rtc_sync_task(void *pv) {
+    (void)pv;
+    ESP_LOGI("NTP", "ntp_rtc_sync_task running on core %d", xPortGetCoreID());
+
+    while (1) {
+        EventBits_t bits = xEventGroupWaitBits(
+            s_wifi_eg,
+            WIFI_CONNECTED_BIT,
+            pdFALSE,
+            pdFALSE,
+            pdMS_TO_TICKS(RTC_NTP_RETRY_MS)
+        );
+
+        if (!(bits & WIFI_CONNECTED_BIT)) {
+            ESP_LOGW("NTP", "Chưa có WiFi, hoãn sync NTP -> DS3231");
+            continue;
+        }
+
+        ntp_start_once();
+
+        bool ok = false;
+        if (ntp_wait_time_valid(NTP_SYNC_TIMEOUT_MS)) {
+            ok = rtc_sync_from_ntp_if_needed();
+        }
+
+        if (ok) {
+            vTaskDelay(pdMS_TO_TICKS(RTC_NTP_SYNC_PERIOD_MS));
+        } else {
+            ESP_LOGW("NTP", "Sync NTP -> DS3231 thất bại, thử lại sau %d phút", RTC_NTP_RETRY_MS / 60000);
+            vTaskDelay(pdMS_TO_TICKS(RTC_NTP_RETRY_MS));
         }
     }
 }
 
 static void rtc_get_iso(char *buf, size_t len) {
     struct tm t = {0};
-    if (ds3231_get_time(&s_rtc_dev, &t) == ESP_OK && t.tm_year > 100) {
+    if (rtc_get_time_safe(&t) && t.tm_year > 100) {
         strftime(buf, len, "%Y-%m-%dT%H:%M:%S+07:00", &t);
     } else {
         long up = (long)(esp_timer_get_time() / 1000000);
@@ -367,26 +694,22 @@ static bool rtc_get_phase_from_planting_time(int *phase_out,
                                              char *source,
                                              size_t source_len) {
     struct tm now = {0};
-    if (ds3231_get_time(&s_rtc_dev, &now) != ESP_OK || now.tm_year <= 100) {
+    if (!rtc_get_time_safe(&now) || now.tm_year <= 100) {
         if (phase_out) *phase_out = s_current_phase;
         if (days_out)  *days_out = -1.0f;
         if (source) strlcpy(source, "RTC_ERROR", source_len);
         return false;
     }
 
-    struct tm start = {0};
-    start.tm_year = PLANTING_START_YEAR - 1900;
-    start.tm_mon  = PLANTING_START_MONTH - 1;
-    start.tm_mday = PLANTING_START_DAY;
-    start.tm_hour = PLANTING_START_HOUR;
-    start.tm_min  = PLANTING_START_MIN;
-    start.tm_sec  = PLANTING_START_SEC;
-    start.tm_isdst = -1;
-    now.tm_isdst = -1;
+    if (!s_planting_start_valid || s_planting_start_epoch <= 0) {
+        if (phase_out) *phase_out = s_current_phase;
+        if (days_out)  *days_out = -1.0f;
+        if (source) strlcpy(source, "NVS_NO_START", source_len);
+        return false;
+    }
 
-    time_t now_epoch   = mktime(&now);
-    time_t start_epoch = mktime(&start);
-    double diff_s = difftime(now_epoch, start_epoch);
+    time_t now_epoch = tm_local_to_epoch(now);
+    double diff_s = difftime(now_epoch, s_planting_start_epoch);
     float days = (float)(diff_s / 86400.0);
     if (days < 0.0f) days = 0.0f;
 
@@ -394,13 +717,13 @@ static bool rtc_get_phase_from_planting_time(int *phase_out,
 
     if (phase_out) *phase_out = phase;
     if (days_out)  *days_out = days;
-    if (source) strlcpy(source, "ESP32_RTC", source_len);
+    if (source) strlcpy(source, "ESP32_RTC_NVS", source_len);
     return true;
 }
 
 static bool rtc_get_hour_utc7(int *hour_out) {
     struct tm t = {0};
-    if (ds3231_get_time(&s_rtc_dev, &t) == ESP_OK && t.tm_year > 100) {
+    if (rtc_get_time_safe(&t) && t.tm_year > 100) {
         *hour_out = t.tm_hour;
         return true;
     }
@@ -435,6 +758,8 @@ static int build_json(char *buf, size_t buf_len, const sensor_data_t *s, int ste
         "\"phase\":%d,"
         "\"phase_source\":\"%s\","
         "\"days_after_planting\":%.3f,"
+        "\"planting_start_epoch\":%lld,"
+        "\"planting_start_valid\":%s,"
         "\"sensor\":{"
             "\"temperature\":%.1f,"
             "\"air_humidity\":%.1f,"
@@ -451,6 +776,8 @@ static int build_json(char *buf, size_t buf_len, const sensor_data_t *s, int ste
             "\"ads1115_ok\":%s,"
             "\"rtc_ok\":%s,"
             "\"pump_on\":%s,"
+            "\"pump_mode\":\"%s\","
+            "\"pump_reason\":\"%s\","
             "\"light_on\":%s,"
             "\"light_mode\":\"%s\","
             "\"light_reason\":\"%s\""
@@ -460,6 +787,8 @@ static int build_json(char *buf, size_t buf_len, const sensor_data_t *s, int ste
         s->uptime_s, s->phase,
         s->phase_source[0] ? s->phase_source : "UNKNOWN",
         s->days_after_planting,
+        (long long)s_planting_start_epoch,
+        s_planting_start_valid ? "true" : "false",
         s->temperature, s->air_humidity, s->lux, soil_avg,
         s->soil_pct[0], s->soil_pct[1], s->soil_pct[2], s->soil_pct[3],
         s->wifi_rssi,
@@ -468,6 +797,8 @@ static int build_json(char *buf, size_t buf_len, const sensor_data_t *s, int ste
         s->ads1115_ok ? "true" : "false",
         s->rtc_ok     ? "true" : "false",
         s->pump_state ? "true" : "false",
+        s->pump_mode[0] ? s->pump_mode : "AI_AUTO",
+        s->pump_reason[0] ? s->pump_reason : "UNKNOWN",
         s->light_state ? "true" : "false",
         s->light_mode[0] ? s->light_mode : "AUTO_RTC",
         s->light_reason[0] ? s->light_reason : "UNKNOWN"
@@ -485,6 +816,329 @@ static const char *phase_to_text(int phase) {
 static float soil_avg_from_snapshot(const sensor_data_t *s) {
     return (s->soil_pct[0] + s->soil_pct[1] +
             s->soil_pct[2] + s->soil_pct[3]) / 4.0f;
+}
+
+
+/* ================================================================
+   DIGITAL TWIN DIRECT CONTROL HELPERS
+   ================================================================ */
+
+static bool pump_direct_active(void) {
+    return (s_pump_direct_until_us > 0 && esp_timer_get_time() < s_pump_direct_until_us);
+}
+
+static bool light_direct_active(void) {
+    return (s_light_direct_until_us > 0 && esp_timer_get_time() < s_light_direct_until_us);
+}
+
+static void mqtt_data_to_cstr(esp_mqtt_event_handle_t ev, char *out, size_t out_len) {
+    if (!out || out_len == 0) return;
+    size_t n = (ev->data_len < (int)(out_len - 1)) ? ev->data_len : (out_len - 1);
+    memcpy(out, ev->data, n);
+    out[n] = '\0';
+}
+
+static bool json_get_string_value(const char *json, const char *key, char *out, size_t out_len) {
+    if (!json || !key || !out || out_len == 0) return false;
+    char pattern[32];
+    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    const char *p = strstr(json, pattern);
+    if (!p) return false;
+    p = strchr(p + strlen(pattern), ':');
+    if (!p) return false;
+    p++;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p != '"') return false;
+    p++;
+    size_t i = 0;
+    while (*p && *p != '"' && i + 1 < out_len) {
+        out[i++] = *p++;
+    }
+    out[i] = '\0';
+    return i > 0;
+}
+
+static int json_get_int_value(const char *json, const char *key, int default_value) {
+    if (!json || !key) return default_value;
+    char pattern[32];
+    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    const char *p = strstr(json, pattern);
+    if (!p) return default_value;
+    p = strchr(p + strlen(pattern), ':');
+    if (!p) return default_value;
+    p++;
+    while (*p == ' ' || *p == '\t') p++;
+    return atoi(p);
+}
+
+static bool parse_on_off_command(const char *payload, bool default_on) {
+    char state[16] = {0};
+    if (json_get_string_value(payload, "state", state, sizeof(state)) ||
+        json_get_string_value(payload, "cmd", state, sizeof(state)) ||
+        json_get_string_value(payload, "action", state, sizeof(state))) {
+        return (strcasecmp(state, "ON") == 0 ||
+                strcasecmp(state, "PUMP_ON") == 0 ||
+                strcasecmp(state, "LIGHT_ON") == 0 ||
+                strcmp(state, "1") == 0 ||
+                strcasecmp(state, "TRUE") == 0);
+    }
+
+    if (strstr(payload, "ON") || strstr(payload, "on") || strstr(payload, "true") || strstr(payload, "1")) {
+        return true;
+    }
+    if (strstr(payload, "OFF") || strstr(payload, "off") || strstr(payload, "false") || strstr(payload, "0")) {
+        return false;
+    }
+    return default_on;
+}
+
+static int parse_duration_s(const char *payload, int default_s, int max_s) {
+    int d = json_get_int_value(payload, "duration_s", -1);
+    if (d < 0) d = json_get_int_value(payload, "duration", -1);
+    if (d < 0) d = default_s;
+    if (d < 0) d = 0;
+    if (d > max_s) d = max_s;
+    return d;
+}
+
+static int64_t json_get_int64_value(const char *json, const char *key, int64_t default_value) {
+    if (!json || !key) return default_value;
+    char pattern[40];
+    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    const char *p = strstr(json, pattern);
+    if (!p) return default_value;
+    p = strchr(p + strlen(pattern), ':');
+    if (!p) return default_value;
+    p++;
+    while (*p == ' ' || *p == '\t' || *p == '"') p++;
+    return strtoll(p, NULL, 10);
+}
+
+static bool planting_command_is_duplicate(const char *cmd_id) {
+    return (cmd_id && cmd_id[0] && s_last_planting_cmd_id[0] &&
+            strncmp(cmd_id, s_last_planting_cmd_id, sizeof(s_last_planting_cmd_id)) == 0);
+}
+
+static void publish_planting_status(const char *event, const char *cmd_id, const char *status, const char *reason) {
+    if (!s_mqtt_connected || !s_mqtt) return;
+
+    char start_iso[32];
+    char now_iso[32];
+    epoch_to_iso_utc7(s_planting_start_epoch, start_iso, sizeof(start_iso));
+    rtc_get_iso(now_iso, sizeof(now_iso));
+
+    char payload[512];
+    int len = snprintf(payload, sizeof(payload),
+        "{"
+        "\"node_id\":\"%s\","
+        "\"event\":\"%s\","
+        "\"command_id\":\"%s\","
+        "\"status\":\"%s\","
+        "\"planting_start_epoch\":%lld,"
+        "\"planting_start_time\":\"%s\","
+        "\"planting_start_valid\":%s,"
+        "\"reason\":\"%s\","
+        "\"timestamp\":\"%s\""
+        "}",
+        NODE_ID,
+        event ? event : "planting_start_status",
+        cmd_id ? cmd_id : "",
+        status ? status : "OK",
+        (long long)s_planting_start_epoch,
+        start_iso,
+        s_planting_start_valid ? "true" : "false",
+        reason ? reason : "",
+        now_iso);
+
+    if (len > 0) esp_mqtt_client_publish(s_mqtt, TOPIC_STATUS, payload, len, MQTT_QOS, 0);
+}
+
+static bool planting_start_init_from_nvs_or_rtc(void) {
+    if (planting_start_load_from_nvs()) return true;
+
+    time_t now_epoch = 0;
+    if (!rtc_get_epoch_from_ds3231(&now_epoch)) {
+        ESP_LOGE(TAG, "PLANTING: NVS chưa có mốc và RTC chưa hợp lệ -> giữ BOOT_DEFAULT");
+        return false;
+    }
+
+    bool ok = planting_start_save_to_nvs(now_epoch, "BOOT_INIT");
+    if (ok) ESP_LOGW(TAG, "PLANTING: NVS chưa có mốc, lấy RTC hiện tại làm mốc gieo ban đầu");
+    return ok;
+}
+
+static void handle_planting_start_command(esp_mqtt_event_handle_t ev) {
+    char payload[320];
+    char action[24] = {0};
+    char cmd_id[PLANTING_CMD_ID_MAX] = {0};
+    char reason[64] = {0};
+    mqtt_data_to_cstr(ev, payload, sizeof(payload));
+
+    json_get_string_value(payload, "command_id", cmd_id, sizeof(cmd_id));
+    if (!cmd_id[0]) json_get_string_value(payload, "id", cmd_id, sizeof(cmd_id));
+    if (!cmd_id[0]) snprintf(cmd_id, sizeof(cmd_id), "mqtt-%lld", (long long)(esp_timer_get_time() / 1000));
+
+    if (planting_command_is_duplicate(cmd_id)) {
+        ESP_LOGW(TAG, "PLANTING: bỏ qua command trùng cmd_id=%s", cmd_id);
+        publish_planting_status("planting_start_duplicate", cmd_id, "DUPLICATE", "duplicate_command_id");
+        return;
+    }
+
+    if (!json_get_string_value(payload, "action", action, sizeof(action))) strlcpy(action, "SET_NOW", sizeof(action));
+    json_get_string_value(payload, "reason", reason, sizeof(reason));
+
+    if (strcasecmp(action, "SET_NOW") == 0) {
+        time_t now_epoch = 0;
+        if (!rtc_get_epoch_from_ds3231(&now_epoch)) {
+            ESP_LOGE(TAG, "PLANTING: SET_NOW thất bại vì RTC invalid");
+            publish_planting_status("planting_start_error", cmd_id, "ERROR", "rtc_invalid");
+            return;
+        }
+        if (planting_start_save_to_nvs(now_epoch, cmd_id)) {
+            publish_planting_status("planting_start_updated", cmd_id, "DONE", reason[0] ? reason : "SET_NOW");
+        } else {
+            publish_planting_status("planting_start_error", cmd_id, "ERROR", "nvs_save_failed");
+        }
+    } else if (strcasecmp(action, "SET_EPOCH") == 0) {
+        int64_t epoch = json_get_int64_value(payload, "planting_start_epoch", 0);
+        if (epoch <= 0) epoch = json_get_int64_value(payload, "epoch", 0);
+        if (epoch <= 0) {
+            publish_planting_status("planting_start_error", cmd_id, "ERROR", "missing_epoch");
+            return;
+        }
+        if (planting_start_save_to_nvs((time_t)epoch, cmd_id)) {
+            publish_planting_status("planting_start_updated", cmd_id, "DONE", reason[0] ? reason : "SET_EPOCH");
+        } else {
+            publish_planting_status("planting_start_error", cmd_id, "ERROR", "nvs_save_failed");
+        }
+    } else if (strcasecmp(action, "CLEAR") == 0) {
+        planting_start_clear_nvs();
+        planting_start_init_from_nvs_or_rtc();
+        publish_planting_status("planting_start_cleared_recreated", cmd_id, "DONE", reason[0] ? reason : "CLEAR");
+    } else if (strcasecmp(action, "GET") == 0) {
+        publish_planting_status("planting_start_current", cmd_id, "DONE", reason[0] ? reason : "GET");
+    } else {
+        ESP_LOGW(TAG, "PLANTING: action không hỗ trợ: %s", action);
+        publish_planting_status("planting_start_error", cmd_id, "ERROR", "unsupported_action");
+    }
+}
+
+static void publish_actuator_state(const char *event_reason) {
+    if (!s_mqtt_connected || !s_mqtt) return;
+
+    sensor_data_t snap;
+    if (xSemaphoreTake(s_sensor_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        snap = g_sensor;
+        xSemaphoreGive(s_sensor_mutex);
+    } else {
+        return;
+    }
+
+    char ts[32] = {0};
+    rtc_get_iso(ts, sizeof(ts));
+
+    char payload[512];
+    int len = snprintf(payload, sizeof(payload),
+        "{"
+        "\"node_id\":\"%s\","
+        "\"timestamp\":\"%s\","
+        "\"event\":\"%s\","
+        "\"pump\":{\"state\":\"%s\",\"mode\":\"%s\",\"reason\":\"%s\"},"
+        "\"light\":{\"state\":\"%s\",\"mode\":\"%s\",\"reason\":\"%s\"}"
+        "}",
+        NODE_ID, ts, event_reason ? event_reason : "STATE",
+        snap.pump_state ? "ON" : "OFF",
+        snap.pump_mode[0] ? snap.pump_mode : "AI_AUTO",
+        snap.pump_reason[0] ? snap.pump_reason : "UNKNOWN",
+        snap.light_state ? "ON" : "OFF",
+        snap.light_mode[0] ? snap.light_mode : "AUTO_RTC",
+        snap.light_reason[0] ? snap.light_reason : "UNKNOWN");
+
+    if (len > 0) {
+        esp_mqtt_client_publish(s_mqtt, TOPIC_ACTUATOR_STATE, payload, len, MQTT_QOS, 0);
+    }
+}
+
+static void set_pump_state(bool on, const char *mode, const char *reason) {
+    gpio_set_level(RELAY_PUMP_GPIO, on ? 1 : 0);
+    if (xSemaphoreTake(s_sensor_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        g_sensor.pump_state = on;
+        strlcpy(g_sensor.pump_mode, mode ? mode : "AI_AUTO", sizeof(g_sensor.pump_mode));
+        strlcpy(g_sensor.pump_reason, reason ? reason : "UNKNOWN", sizeof(g_sensor.pump_reason));
+        xSemaphoreGive(s_sensor_mutex);
+    }
+}
+
+static void set_light_state(bool on, const char *mode, const char *reason) {
+    gpio_set_level(RELAY_LIGHT_GPIO, on ? 1 : 0);
+    if (xSemaphoreTake(s_sensor_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        g_sensor.light_state = on;
+        strlcpy(g_sensor.light_mode, mode ? mode : "AUTO_RTC", sizeof(g_sensor.light_mode));
+        strlcpy(g_sensor.light_reason, reason ? reason : "UNKNOWN", sizeof(g_sensor.light_reason));
+        xSemaphoreGive(s_sensor_mutex);
+    }
+}
+
+static void handle_bbb_pump_command(esp_mqtt_event_handle_t ev) {
+    char payload[256];
+    mqtt_data_to_cstr(ev, payload, sizeof(payload));
+
+    if (pump_direct_active()) {
+        ESP_LOGW(TAG, "Ignore BBB cmd/pump while DT direct active: %s", payload);
+        return;
+    }
+
+    bool on = parse_on_off_command(payload, false);
+    set_pump_state(on, "AI_AUTO", "BBB_AI_AUTO");
+    ESP_LOGI(TAG, "BBB AUTO command: Pump -> %s", on ? "ON" : "OFF");
+    publish_actuator_state("BBB_CMD_PUMP");
+}
+
+static void handle_dt_pump_command(esp_mqtt_event_handle_t ev) {
+    char payload[256];
+    char reason[32] = {0};
+    mqtt_data_to_cstr(ev, payload, sizeof(payload));
+
+    bool on = parse_on_off_command(payload, false);
+    int duration_s = parse_duration_s(payload, DT_PUMP_DEFAULT_DURATION_S, DT_PUMP_MAX_DURATION_S);
+    if (!json_get_string_value(payload, "reason", reason, sizeof(reason))) {
+        strlcpy(reason, on ? "DT_DIRECT_ON" : "DT_DIRECT_OFF", sizeof(reason));
+    }
+
+    if (on) {
+        s_pump_direct_until_us = esp_timer_get_time() + ((int64_t)duration_s * 1000000LL);
+        set_pump_state(true, "DIRECT_DT", reason);
+    } else {
+        s_pump_direct_until_us = esp_timer_get_time() + 2000000LL;  /* giữ quyền 2s để tránh BBB gửi ngược ngay */
+        set_pump_state(false, "DIRECT_DT", reason);
+    }
+
+    ESP_LOGW(TAG, "DT command: Pump -> %s duration=%ds reason=%s", on ? "ON" : "OFF", duration_s, reason);
+    publish_actuator_state("DT_CMD_PUMP");
+}
+
+static void handle_dt_light_command(esp_mqtt_event_handle_t ev, const char *mode_name) {
+    char payload[256];
+    char reason[32] = {0};
+    mqtt_data_to_cstr(ev, payload, sizeof(payload));
+
+    bool on = parse_on_off_command(payload, false);
+    int duration_s = parse_duration_s(payload, DT_LIGHT_DEFAULT_DURATION_S, DT_LIGHT_MAX_DURATION_S);
+    if (!json_get_string_value(payload, "reason", reason, sizeof(reason))) {
+        strlcpy(reason, on ? "DT_LIGHT_ON" : "DT_LIGHT_OFF", sizeof(reason));
+    }
+
+    if (on) {
+        s_light_direct_until_us = esp_timer_get_time() + ((int64_t)duration_s * 1000000LL);
+        set_light_state(true, mode_name ? mode_name : "DIRECT_DT", reason);
+    } else {
+        s_light_direct_until_us = esp_timer_get_time() + 2000000LL;
+        set_light_state(false, mode_name ? mode_name : "DIRECT_DT", reason);
+    }
+
+    ESP_LOGW(TAG, "%s command: Light -> %s duration=%ds reason=%s",
+             mode_name ? mode_name : "DT", on ? "ON" : "OFF", duration_s, reason);
+    publish_actuator_state("DT_CMD_LIGHT");
 }
 
 static void log_sensor_snapshot(const sensor_data_t *s, int step, int ring_used) {
@@ -790,9 +1444,15 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
     switch ((esp_mqtt_event_id_t)id) {
         case MQTT_EVENT_CONNECTED:
             s_mqtt_connected = true;
-            esp_mqtt_client_subscribe(s_mqtt, TOPIC_CMD_PUMP,  MQTT_QOS);
-            ESP_LOGI(TAG, "MQTT kết nối %s:%d — subscribed cmd/pump. Phase do ESP32_RTC tự tính | buffer=%d/%d",
+            esp_mqtt_client_subscribe(s_mqtt, TOPIC_CMD_PUMP,     MQTT_QOS);
+            esp_mqtt_client_subscribe(s_mqtt, TOPIC_CMD_LIGHT,    MQTT_QOS);
+            esp_mqtt_client_subscribe(s_mqtt, TOPIC_CMD_PLANTING_START, MQTT_QOS);
+            esp_mqtt_client_subscribe(s_mqtt, TOPIC_DT_CMD_PUMP,  MQTT_QOS);
+            esp_mqtt_client_subscribe(s_mqtt, TOPIC_DT_CMD_LIGHT, MQTT_QOS);
+            ESP_LOGI(TAG,
+                     "MQTT kết nối %s:%d — sub: cmd/pump, cmd/light, planting_start, dt/cmd/pump, dt/cmd/light | buffer=%d/%d",
                      MQTT_BROKER_URI, MQTT_PORT, ring_count(), RING_BUF_SIZE);
+            publish_actuator_state("MQTT_CONNECTED");
             break;
         case MQTT_EVENT_DISCONNECTED:
             s_mqtt_connected = false;
@@ -806,15 +1466,15 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
             break;
         case MQTT_EVENT_DATA:
             if (mqtt_topic_match(ev, TOPIC_CMD_PUMP)) {
-                bool on = (strncmp(ev->data, "ON", ev->data_len) == 0);
-                gpio_set_level(RELAY_PUMP_GPIO, on ? 1 : 0);
-
-                if (xSemaphoreTake(s_sensor_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                    g_sensor.pump_state = on;
-                    xSemaphoreGive(s_sensor_mutex);
-                }
-
-                ESP_LOGI(TAG, "Command: Pump → %s", on ? "ON" : "OFF");
+                handle_bbb_pump_command(ev);
+            } else if (mqtt_topic_match(ev, TOPIC_DT_CMD_PUMP)) {
+                handle_dt_pump_command(ev);
+            } else if (mqtt_topic_match(ev, TOPIC_DT_CMD_LIGHT)) {
+                handle_dt_light_command(ev, "DIRECT_DT");
+            } else if (mqtt_topic_match(ev, TOPIC_CMD_LIGHT)) {
+                handle_dt_light_command(ev, "LEGACY_CMD");
+            } else if (mqtt_topic_match(ev, TOPIC_CMD_PLANTING_START)) {
+                handle_planting_start_command(ev);
             }
             break;
         default: break;
@@ -862,8 +1522,10 @@ static void hw_init(void) {
         g_sensor.phase = DEFAULT_PHASE;
         g_sensor.days_after_planting = 0.0f;
         strlcpy(g_sensor.phase_source, "BOOT_DEFAULT", sizeof(g_sensor.phase_source));
+        strlcpy(g_sensor.pump_mode, "AI_AUTO", sizeof(g_sensor.pump_mode));
+        strlcpy(g_sensor.pump_reason, "BOOT_OFF", sizeof(g_sensor.pump_reason));
         strlcpy(g_sensor.light_mode, "AUTO_RTC", sizeof(g_sensor.light_mode));
-        strlcpy(g_sensor.light_reason, "PHASE1_DARK", sizeof(g_sensor.light_reason));
+        strlcpy(g_sensor.light_reason, "PHASE1_LOW_LIGHT", sizeof(g_sensor.light_reason));
         xSemaphoreGive(s_sensor_mutex);
     }
 
@@ -879,6 +1541,7 @@ static void hw_init(void) {
  * @brief Task: Đọc tuần hoàn dữ liệu từ toàn bộ mảng cảm biến.
  */
 static void sensor_task(void *pv) {
+    ESP_LOGI(TAG, "sensor_task running on core %d", xPortGetCoreID());
     dht11_t dht = { .dht11_pin = DHT11_GPIO };
     i2c_dev_t bh_dev = {0};
     bool bh_ready = false, ads_ready = false;
@@ -917,28 +1580,38 @@ static void sensor_task(void *pv) {
 
         if (bh_ready) {
             uint16_t raw = 0;
-            if (bh1750_read(&bh_dev, &raw) == ESP_OK) {
-                snap.lux = (float)raw / 2.0f; snap.bh1750_ok = true;
+            if (i2c_take(600)) {
+                if (bh1750_read(&bh_dev, &raw) == ESP_OK) {
+                    snap.lux = (float)raw / 2.0f;
+                    snap.bh1750_ok = true;
+                }
+                i2c_give();
             }
         }
 
         if (ads_ready) {
             bool all_ok = true;
-            for (int i = 0; i < SOIL_CH_COUNT; i++) {
-                if (ads111x_set_input_mux(&s_ads_dev, SOIL_MUX[i]) != ESP_OK) { all_ok = false; continue; }
-                if (ads111x_start_conversion(&s_ads_dev) != ESP_OK) { all_ok = false; continue; }
-                vTaskDelay(pdMS_TO_TICKS(150));
-                
-                bool busy = true;
-                for (int w = 0; w < 8 && busy; w++) {
-                    ads111x_is_busy(&s_ads_dev, &busy);
-                    if (busy) vTaskDelay(pdMS_TO_TICKS(25));
+            if (i2c_take(3000)) {
+                for (int i = 0; i < SOIL_CH_COUNT; i++) {
+                    if (ads111x_set_input_mux(&s_ads_dev, SOIL_MUX[i]) != ESP_OK) { all_ok = false; continue; }
+                    if (ads111x_start_conversion(&s_ads_dev) != ESP_OK) { all_ok = false; continue; }
+                    vTaskDelay(pdMS_TO_TICKS(150));
+
+                    bool busy = true;
+                    for (int w = 0; w < 8 && busy; w++) {
+                        ads111x_is_busy(&s_ads_dev, &busy);
+                        if (busy) vTaskDelay(pdMS_TO_TICKS(25));
+                    }
+                    int16_t raw_v = 0;
+                    if (ads111x_get_value(&s_ads_dev, &raw_v) == ESP_OK) {
+                        double voltage = (double)raw_v * 4.096 / 32767.0;
+                        snap.soil_pct[i] = ads_voltage_to_pct(voltage);
+                    } else { all_ok = false; }
                 }
-                int16_t raw_v = 0;
-                if (ads111x_get_value(&s_ads_dev, &raw_v) == ESP_OK) {
-                    double voltage = (double)raw_v * 4.096 / 32767.0;
-                    snap.soil_pct[i] = ads_voltage_to_pct(voltage);
-                } else { all_ok = false; }
+                i2c_give();
+            } else {
+                all_ok = false;
+                ESP_LOGW(TAG, "ADS1115 skip: I2C busy");
             }
             snap.ads1115_ok = all_ok;
         }
@@ -948,6 +1621,12 @@ static void sensor_task(void *pv) {
 
         if (xSemaphoreTake(s_sensor_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
             snap.pump_state = g_sensor.pump_state;
+            strlcpy(snap.pump_mode,
+                    g_sensor.pump_mode[0] ? g_sensor.pump_mode : "AI_AUTO",
+                    sizeof(snap.pump_mode));
+            strlcpy(snap.pump_reason,
+                    g_sensor.pump_reason[0] ? g_sensor.pump_reason : "UNKNOWN",
+                    sizeof(snap.pump_reason));
             snap.light_state = g_sensor.light_state;
             snap.phase       = g_sensor.phase ? g_sensor.phase : DEFAULT_PHASE;
             snap.days_after_planting = g_sensor.days_after_planting;
@@ -978,13 +1657,14 @@ static void sensor_task(void *pv) {
  * @brief Task: ESP32 là nguồn phase chính.
  *
  * Luồng hiện tại:
- * - ESP32 đọc DS3231 RTC và tính days_after_planting từ PLANTING_START_*. 
+ * - ESP32 đọc DS3231 RTC và tính days_after_planting từ planting_start_epoch lưu trong NVS. 
  * - Nếu days_after_planting < DARK_PHASE_DAYS => Phase 1.
  * - Nếu days_after_planting >= DARK_PHASE_DAYS => Phase 2.
  * - ESP32 tự bật/tắt đèn theo phase và lịch RTC.
  * - BBB chỉ nhận phase trong JSON để chạy AI/ghi log, không gửi cmd/phase liên tục.
  */
 static void light_schedule_task(void *pv) {
+    ESP_LOGI(TAG, "light_schedule_task running on core %d", xPortGetCoreID());
     bool last_light_on = false;
     int  last_phase = -1;
     char last_reason[24] = {0};
@@ -1003,13 +1683,37 @@ static void light_schedule_task(void *pv) {
         int hour_utc7 = -1;
         bool rtc_hour_ok = rtc_get_hour_utc7(&hour_utc7);
         bool rtc_ok = rtc_phase_ok && rtc_hour_ok;
+
+        /* Nếu Digital Twin đang điều khiển đèn trực tiếp thì không cho AUTO_RTC ghi đè. */
+        if (light_direct_active()) {
+            if (xSemaphoreTake(s_sensor_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                g_sensor.phase = phase;
+                g_sensor.days_after_planting = days_after_planting;
+                strlcpy(g_sensor.phase_source, phase_source, sizeof(g_sensor.phase_source));
+                g_sensor.rtc_ok = rtc_ok;
+                xSemaphoreGive(s_sensor_mutex);
+            }
+            if (++heartbeat_tick >= (LIGHT_LOG_HEARTBEAT_S * 1000 / LIGHT_CTRL_MS)) {
+                ESP_LOGW(TAG, "LIGHT AUTO_RTC paused: DIRECT_DT active, phase=%d days=%.2f",
+                         phase, days_after_planting);
+                heartbeat_tick = 0;
+            }
+            vTaskDelay(pdMS_TO_TICKS(LIGHT_CTRL_MS));
+            continue;
+        }
+
+        if (s_light_direct_until_us > 0 && !light_direct_active()) {
+            s_light_direct_until_us = 0;
+            ESP_LOGI(TAG, "LIGHT DIRECT expired -> return AUTO_RTC");
+        }
+
         bool light_on = false;
         const char *reason = "RTC_ERROR";
 
         if (rtc_hour_ok) {
             light_on = light_should_be_on_by_schedule(phase, hour_utc7);
-            reason = (phase == PHASE_1_DARK) ? "PHASE1_DARK" :
-                     (light_on ? "PHASE2_SCHEDULE_ON" : "PHASE2_SCHEDULE_OFF");
+            reason = (phase == PHASE_1_DARK) ? "PHASE1_LOW_LIGHT" :
+                     (light_on ? "PHASE2_DAYLIGHT_SIM" : "PHASE2_NIGHT_SIM");
         }
 
         gpio_set_level(RELAY_LIGHT_GPIO, light_on ? 1 : 0);
@@ -1046,10 +1750,55 @@ static void light_schedule_task(void *pv) {
     }
 }
 
+
+/**
+ * @brief Task: Bảo vệ actuator direct mode và publish trạng thái relay thật.
+ *
+ * - Nếu Digital Twin bật bơm với duration_s, ESP32 tự tắt khi hết thời gian.
+ * - Publish định kỳ actuator/state để BBB/Influx xác nhận trạng thái vật lý.
+ */
+static void actuator_state_task(void *pv) {
+    ESP_LOGI(TAG, "actuator_state_task running on core %d", xPortGetCoreID());
+    int64_t last_pub_us = 0;
+
+    while (1) {
+        int64_t now = esp_timer_get_time();
+
+        if (s_pump_direct_until_us > 0 && now >= s_pump_direct_until_us) {
+            bool was_on = false;
+            if (xSemaphoreTake(s_sensor_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                was_on = g_sensor.pump_state;
+                xSemaphoreGive(s_sensor_mutex);
+            }
+
+            if (was_on) {
+                set_pump_state(false, "AI_AUTO", "DIRECT_TIMEOUT_OFF");
+                ESP_LOGW(TAG, "Pump DIRECT timeout -> OFF, return AI_AUTO");
+                publish_actuator_state("PUMP_DIRECT_TIMEOUT");
+            }
+            s_pump_direct_until_us = 0;
+        }
+
+        if (s_light_direct_until_us > 0 && now >= s_light_direct_until_us) {
+            s_light_direct_until_us = 0;
+            ESP_LOGI(TAG, "Light DIRECT timeout -> AUTO_RTC will resume by schedule task");
+            publish_actuator_state("LIGHT_DIRECT_TIMEOUT");
+        }
+
+        if (s_mqtt_connected && (now - last_pub_us) >= ((int64_t)ACTUATOR_STATE_PUBLISH_MS * 1000LL)) {
+            publish_actuator_state("PERIODIC_STATE");
+            last_pub_us = now;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
+
 /**
  * @brief Task: Xuất dữ liệu lên MQTT và giải phóng bộ đệm (Drain Buffer).
  */
 static void publish_task(void *pv) {
+    ESP_LOGI(TAG, "publish_task running on core %d", xPortGetCoreID());
     static char json_buf[JSON_MAX_LEN];
     static char drain_buf[JSON_MAX_LEN];
 
@@ -1106,8 +1855,11 @@ static void publish_task(void *pv) {
 
 void app_main(void) {
     ESP_LOGI(TAG, "=== %s | %s v%s ===", PLANT_NAME, NODE_ID, FW_VERSION);
-    ESP_LOGI(TAG, "MQTT broker=%s:%d | sensor=%s | cmd_pump=%s | phase_source=ESP32_RTC",
-             MQTT_BROKER_URI, MQTT_PORT, TOPIC_SENSOR, TOPIC_CMD_PUMP);
+    ESP_LOGI(TAG, "MQTT broker=%s:%d | sensor=%s | auto_pump=%s | dt_pump=%s | dt_light=%s | actuator_state=%s",
+             MQTT_BROKER_URI, MQTT_PORT, TOPIC_SENSOR, TOPIC_CMD_PUMP,
+             TOPIC_DT_CMD_PUMP, TOPIC_DT_CMD_LIGHT, TOPIC_ACTUATOR_STATE);
+    ESP_LOGI(TAG, "Planting topic=%s | start=NVS after RTC/NTP check | dark_days=%.1f",
+             TOPIC_CMD_PLANTING_START, DARK_PHASE_DAYS);
 
     esp_err_t nvs_ret = nvs_flash_init();
     if (nvs_ret == ESP_ERR_NVS_NO_FREE_PAGES || nvs_ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -1116,14 +1868,41 @@ void app_main(void) {
     }
 
     s_sensor_mutex = xSemaphoreCreateMutex();
+    s_i2c_mutex = xSemaphoreCreateMutex();
+    setenv("TZ", TZ_INFO_UTC7, 1);
+    tzset();
     ring_init();
     hw_init();
     wifi_init();
+
+    /* BOOT FLOW chuẩn:
+     * 1) Nếu WiFi có IP thì check NTP và cập nhật DS3231 nếu lệch.
+     * 2) Sau khi RTC đã được kiểm tra, load/create planting_start_epoch trong NVS.
+     * 3) Task NTP sau đó chỉ sync DS3231 định kỳ, KHÔNG ghi lại mốc gieo.
+     */
+    EventBits_t boot_wifi_bits = xEventGroupGetBits(s_wifi_eg);
+    if (boot_wifi_bits & WIFI_CONNECTED_BIT) {
+        ntp_start_once();
+        if (ntp_wait_time_valid(NTP_SYNC_TIMEOUT_MS)) {
+            rtc_sync_from_ntp_if_needed();
+        }
+    } else {
+        ESP_LOGW(TAG, "BOOT: chưa có WiFi, bỏ qua NTP ban đầu; dùng DS3231 hiện có để xét planting_start");
+    }
+    planting_start_init_from_nvs_or_rtc();
+
     mqtt_init();
 
-    xTaskCreate(sensor_task,         "sensor",  4096, NULL, 5, NULL);
-    xTaskCreate(light_schedule_task, "light",   3072, NULL, 4, NULL);
-    xTaskCreate(publish_task,        "publish", 4096, NULL, 3, NULL);
+    /* Core pinning:
+     * CORE_NET: MQTT publish + NTP
+     * CORE_APP: Sensor + RTC phase/light + actuator safety
+     */
+    xTaskCreatePinnedToCore(ntp_rtc_sync_task,   "ntp_rtc", 4096, NULL, 3, NULL, CORE_NET);
+    xTaskCreatePinnedToCore(publish_task,        "publish",  4096, NULL, 3, NULL, CORE_NET);
 
-    ESP_LOGI(TAG, "Tất cả tasks đã khởi động (RTC phase owner + Multi-WiFi)");
+    xTaskCreatePinnedToCore(sensor_task,         "sensor",   4096, NULL, 5, NULL, CORE_APP);
+    xTaskCreatePinnedToCore(light_schedule_task, "light",    3072, NULL, 4, NULL, CORE_APP);
+    xTaskCreatePinnedToCore(actuator_state_task, "act_state",4096, NULL, 4, NULL, CORE_APP);
+
+    ESP_LOGI(TAG, "Tất cả tasks đã khởi động (RTC phase owner + Multi-WiFi + DT direct actuator)");
 }

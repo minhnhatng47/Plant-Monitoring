@@ -13,7 +13,7 @@ AUTO CONTROL:
 
 DIGITAL TWIN CONTROL:
     Digital Twin/Web/Unity -> InfluxDB measurement dt_commands
-    BBB Gateway poll dt_commands PENDING -> MQTT cps/greenhouse/dt/cmd/pump/light -> ESP32
+    BBB Gateway poll dt_commands PENDING -> MQTT cps/greenhouse/dt/cmd/pump/light hoặc cmd/planting_start -> ESP32
     ESP32 -> cps/greenhouse/actuator/state -> BBB
     BBB -> InfluxDB actuator_state + dt_command_events
 
@@ -66,7 +66,7 @@ BASE_DIR = Path(__file__).resolve().parent
 
 NODE_ID = "BRASSICA_JUNCEA_01"
 PLANT_NAME = "Rau Cải Mầm (Brassica juncea)"
-GW_VERSION = "3.3-influx-dt-bridge-token-fallback"
+GW_VERSION = "3.4-influx-dt-planting-command"
 
 MODEL_PATH = BASE_DIR / "watering_random_forest_model.pkl"
 FEATURES_PATH = BASE_DIR / "model_features.json"
@@ -86,6 +86,7 @@ TOPIC_ACTUATOR_STATE = "cps/greenhouse/actuator/state"
 # BBB -> ESP32: AUTO control
 TOPIC_CMD_PUMP = "cps/greenhouse/cmd/pump"
 TOPIC_CMD_LIGHT = "cps/greenhouse/cmd/light"  # legacy/manual, không publish trong AUTO
+TOPIC_CMD_PLANTING_START = "cps/greenhouse/cmd/planting_start"
 
 # BBB Influx Bridge -> ESP32: Digital Twin direct command
 TOPIC_DT_CMD_PUMP = "cps/greenhouse/dt/cmd/pump"
@@ -226,7 +227,7 @@ class InfluxManager:
       sensor_data        : telemetry time-series
       actuator_state     : physical relay feedback from ESP32
       latest_state       : JSON snapshot for Digital Twin
-      dt_commands        : command queue written by Digital Twin
+      dt_commands        : command queue written by Digital Twin/Web, gồm pump/light/planting_start
       dt_command_events  : SENT / DONE / ERROR event log written by Gateway
 
     Important:
@@ -365,35 +366,76 @@ class InfluxManager:
         self,
         command_id: str,
         target: str,
-        state: str,
-        duration_s: int,
-        reason: str,
+        state: str = "",
+        duration_s: int = 0,
+        reason: str = "",
         source: str = "digital_twin",
+        action: str = "",
+        planting_start_epoch: int = 0,
     ) -> None:
         """
-        Digital Twin/Web/Unity should write this same shape.
+        Digital Twin/Web/Unity writes this same shape to InfluxDB.
 
         Measurement: dt_commands
-        Tags       : node_id, command_id, target, status=PENDING
-        Fields     : state, duration_s, reason, source
+
+        Common tags:
+          node_id, command_id, target, status=PENDING
+
+        Pump/light fields:
+          state, duration_s, reason, source
+
+        Planting-start fields:
+          action = SET_NOW | SET_EPOCH | CLEAR | GET
+          planting_start_epoch = unix epoch seconds, only needed for SET_EPOCH
+          reason, source
         """
+        target = str(target).strip().lower()
+
         point = (
             Point("dt_commands")
             .tag("node_id", NODE_ID)
             .tag("command_id", command_id)
             .tag("target", target)
             .tag("status", "PENDING")
-            .field("state", state.upper())
-            .field("duration_s", int(duration_s))
-            .field("reason", reason)
-            .field("source", source)
+            .field("reason", reason or "dt_command")
+            .field("source", source or "digital_twin")
             .time(datetime.now(timezone.utc), WRITE_PRECISION_SECONDS)
         )
+
+        if target == "planting_start":
+            action = (action or "SET_NOW").strip().upper()
+            point = point.field("action", action)
+            if planting_start_epoch:
+                point = point.field("planting_start_epoch", int(planting_start_epoch))
+        else:
+            point = (
+                point
+                .field("state", state.upper())
+                .field("duration_s", int(duration_s))
+            )
+
         self.write_api.write(bucket=self.bucket, record=point)
 
-    def insert_test_command(self, target: str, state: str, duration_s: int, reason: str) -> str:
+    def insert_test_command(
+        self,
+        target: str,
+        state: str = "",
+        duration_s: int = 0,
+        reason: str = "cli_test",
+        action: str = "",
+        planting_start_epoch: int = 0,
+    ) -> str:
         command_id = f"cmd-{uuid.uuid4().hex[:12]}"
-        self.write_command(command_id, target, state, duration_s, reason, source="cli_test")
+        self.write_command(
+            command_id=command_id,
+            target=target,
+            state=state,
+            duration_s=duration_s,
+            reason=reason,
+            source="cli_test",
+            action=action,
+            planting_start_epoch=planting_start_epoch,
+        )
         return command_id
 
     # -------------------------------------------------------------------------
@@ -447,6 +489,8 @@ from(bucket: "{self.bucket}")
                     "duration_s": safe_int(v.get("duration_s"), 0),
                     "reason": str(v.get("reason") or "influx_command"),
                     "source": str(v.get("source") or "digital_twin"),
+                    "action": str(v.get("action") or ""),
+                    "planting_start_epoch": safe_int(v.get("planting_start_epoch"), 0),
                 })
 
         return commands
@@ -877,7 +921,7 @@ class GatewayApp:
         self.log.info(f"MQTT  : {self.broker}:{self.port}")
         self.log.info(f"Influx: {self.influx.url} org={self.influx.org} bucket={self.influx.bucket}")
         self.log.info(f"Model features: {self.controller.features}")
-        self.log.info("Flow: DT -> InfluxDB dt_commands -> Gateway -> MQTT -> ESP32")
+        self.log.info("Flow: DT/Web -> InfluxDB dt_commands -> Gateway -> MQTT -> ESP32")
         self.log.info("═" * 72)
 
         self.influx.start()
@@ -926,6 +970,7 @@ class GatewayApp:
         if rc == 0:
             self.log.info("✅ MQTT connected.")
             client.subscribe(TOPIC_SENSOR, qos=MQTT_QOS)
+            client.subscribe(TOPIC_STATUS, qos=MQTT_QOS)
             client.subscribe(TOPIC_ACTUATOR_STATE, qos=MQTT_QOS)
             client.publish(
                 TOPIC_STATUS,
@@ -938,7 +983,7 @@ class GatewayApp:
                 }, ensure_ascii=False),
                 retain=True,
             )
-            self.log.info(f"Subscribed: {TOPIC_SENSOR}, {TOPIC_ACTUATOR_STATE}")
+            self.log.info(f"Subscribed: {TOPIC_SENSOR}, {TOPIC_STATUS}, {TOPIC_ACTUATOR_STATE}")
         else:
             self.log.error(f"MQTT connect failed rc={rc}")
 
@@ -958,6 +1003,8 @@ class GatewayApp:
         try:
             if msg.topic == TOPIC_SENSOR:
                 self._handle_sensor(raw)
+            elif msg.topic == TOPIC_STATUS:
+                self._handle_status(raw)
             elif msg.topic == TOPIC_ACTUATOR_STATE:
                 self._handle_actuator_state(raw)
             else:
@@ -1045,6 +1092,58 @@ class GatewayApp:
             f"light={light_state}/{state['light']['mode']}"
         )
 
+    def _handle_status(self, raw: dict) -> None:
+        """Handle ESP32 status ACKs, especially planting_start command acknowledgements."""
+        try:
+            self.influx.write_latest_state("status", raw)
+        except Exception as exc:
+            self.log.debug(f"latest_state status write skipped: {exc}")
+
+        command_id = str(raw.get("command_id") or raw.get("id") or "").strip()
+        event = str(raw.get("event") or "").strip()
+        target = str(raw.get("target") or "").strip().lower()
+        status = str(raw.get("status") or "").strip().upper()
+
+        is_planting_ack = (
+            target == "planting_start"
+            or event.startswith("planting_start")
+            or event in ("planting_start_updated", "planting_start_current", "planting_start_cleared")
+        )
+
+        if not command_id or not is_planting_ack:
+            return
+
+        # ESP32 should normally respond with status=DONE for SET_NOW/SET_EPOCH/CLEAR/GET.
+        done_events = {
+            "planting_start_updated",
+            "planting_start_current",
+            "planting_start_cleared",
+        }
+        if status in ("ERROR", "FAILED", "FAIL"):
+            event_status = "ERROR"
+        elif status in ("DONE", "OK", "SUCCESS") or event in done_events:
+            event_status = "DONE"
+        else:
+            event_status = "DONE"
+
+        try:
+            self.influx.write_command_event(
+                command_id,
+                "planting_start",
+                event_status,
+                json.dumps(raw, ensure_ascii=False),
+            )
+        except Exception as exc:
+            self.log.error(f"[InfluxDB] planting_start ACK event write error: {exc}")
+
+        self.processed_command_ids.add(command_id)
+        self.sent_commands.pop(command_id, None)
+
+        self.log.info(
+            f"[PLANTING_ACK] command_id={command_id} event={event} "
+            f"status={event_status} start={raw.get('planting_start_epoch')}"
+        )
+
     # -------------------------------------------------------------------------
     # InfluxDB dt_commands -> MQTT dt/cmd bridge
     # -------------------------------------------------------------------------
@@ -1064,7 +1163,12 @@ class GatewayApp:
 
     def _send_influx_command(self, cmd: dict) -> None:
         command_id = cmd["command_id"]
-        target = cmd["target"]
+        target = str(cmd["target"]).strip().lower()
+
+        if target == "planting_start":
+            self._send_planting_start_command(cmd)
+            return
+
         state = normalize_state(cmd["state"])
 
         if target not in ("pump", "light"):
@@ -1084,6 +1188,7 @@ class GatewayApp:
         topic = TOPIC_DT_CMD_PUMP if target == "pump" else TOPIC_DT_CMD_LIGHT
         payload = {
             "id": command_id,
+            "command_id": command_id,
             "source": cmd.get("source") or "digital_twin_influx",
             "mode": "DIRECT",
             "target": target,
@@ -1102,6 +1207,55 @@ class GatewayApp:
             self.log.warning(f"[INFLUX_BRIDGE] SENT id={command_id} -> {topic}: {state} duration={duration_s}s")
         else:
             self.influx.write_command_event(command_id, target, "ERROR", f"mqtt publish rc={result.rc}")
+
+    def _send_planting_start_command(self, cmd: dict) -> None:
+        """Bridge target=planting_start from InfluxDB to ESP32 via MQTT."""
+        command_id = cmd["command_id"]
+        action = str(cmd.get("action") or "SET_NOW").strip().upper()
+        reason = cmd.get("reason") or "planting_start_command"
+
+        allowed_actions = {"SET_NOW", "SET_EPOCH", "CLEAR", "GET"}
+        if action not in allowed_actions:
+            self.influx.write_command_event(command_id, "planting_start", "ERROR", f"invalid action={action}")
+            self.processed_command_ids.add(command_id)
+            return
+
+        payload = {
+            "id": command_id,
+            "command_id": command_id,
+            "source": cmd.get("source") or "digital_twin_influx",
+            "target": "planting_start",
+            "action": action,
+            "reason": reason,
+            "sent_at": utc_now_iso(),
+        }
+
+        if action == "SET_EPOCH":
+            epoch = safe_int(cmd.get("planting_start_epoch"), 0)
+            if epoch <= 0:
+                self.influx.write_command_event(
+                    command_id,
+                    "planting_start",
+                    "ERROR",
+                    "SET_EPOCH requires planting_start_epoch > 0",
+                )
+                self.processed_command_ids.add(command_id)
+                return
+            payload["planting_start_epoch"] = epoch
+
+        result = self.client.publish(
+            TOPIC_CMD_PLANTING_START,
+            json.dumps(payload, ensure_ascii=False),
+            qos=MQTT_QOS,
+        )
+
+        if result.rc == mqtt.MQTT_ERR_SUCCESS:
+            self.influx.write_command_event(command_id, "planting_start", "SENT", json.dumps(payload, ensure_ascii=False))
+            self.processed_command_ids.add(command_id)
+            self.sent_commands[command_id] = {"target": "planting_start", "action": action}
+            self.log.warning(f"[INFLUX_BRIDGE] SENT id={command_id} -> {TOPIC_CMD_PLANTING_START}: {action}")
+        else:
+            self.influx.write_command_event(command_id, "planting_start", "ERROR", f"mqtt publish rc={result.rc}")
 
     def _set_direct_active(self, target: str, duration_s: int) -> None:
         with self.direct_lock:
@@ -1137,7 +1291,7 @@ def main() -> None:
     parser.add_argument("--config", default=str(CONFIG_PATH))
     parser.add_argument("--poll-commands-s", type=float, default=1.0)
     parser.add_argument("--debug", action="store_true")
-    parser.add_argument("--insert-test", choices=["pump_on", "pump_off", "light_on", "light_off"])
+    parser.add_argument("--insert-test", choices=["pump_on", "pump_off", "light_on", "light_off", "planting_start_now", "planting_start_get", "planting_start_clear"])
 
     args = parser.parse_args()
 
@@ -1145,14 +1299,23 @@ def main() -> None:
         log = setup_logging(args.debug)
         influx = InfluxManager(log)
         mapping = {
-            "pump_on": ("pump", "ON", 10),
-            "pump_off": ("pump", "OFF", 0),
-            "light_on": ("light", "ON", 300),
-            "light_off": ("light", "OFF", 0),
+            "pump_on": ("pump", "ON", 10, "", "cli_test"),
+            "pump_off": ("pump", "OFF", 0, "", "cli_test"),
+            "light_on": ("light", "ON", 300, "", "cli_test"),
+            "light_off": ("light", "OFF", 0, "", "cli_test"),
+            "planting_start_now": ("planting_start", "", 0, "SET_NOW", "cli_test_new_batch"),
+            "planting_start_get": ("planting_start", "", 0, "GET", "cli_test_get_start"),
+            "planting_start_clear": ("planting_start", "", 0, "CLEAR", "cli_test_clear_start"),
         }
-        target, state, duration = mapping[args.insert_test]
-        command_id = influx.insert_test_command(target, state, duration_s=duration, reason="cli_test")
-        print(f"Inserted InfluxDB command_id={command_id}: {target} {state} duration={duration}")
+        target, state, duration, action, reason = mapping[args.insert_test]
+        command_id = influx.insert_test_command(
+            target,
+            state,
+            duration_s=duration,
+            reason=reason,
+            action=action,
+        )
+        print(f"Inserted InfluxDB command_id={command_id}: target={target} state={state} action={action} duration={duration}")
         return
 
     _app = GatewayApp(
@@ -1173,4 +1336,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
