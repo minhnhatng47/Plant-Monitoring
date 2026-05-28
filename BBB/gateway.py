@@ -6,16 +6,16 @@ gateway.py — BBB Edge AI Gateway + InfluxDB Digital Twin Bridge
 Flow mới, không dùng SQL:
 
 TELEMETRY:
-    ESP32 -> MQTT -> BBB Gateway -> InfluxDB sensor_data/latest_state
+    ESP32 -> MQTT -> BBB Gateway -> InfluxDB sensors/status
 
 AUTO CONTROL:
     ESP32 sensor -> BBB Gateway Random Forest -> cps/greenhouse/cmd/pump -> ESP32
 
 DIGITAL TWIN CONTROL:
-    Digital Twin/Web/Unity -> InfluxDB measurement dt_commands
-    BBB Gateway poll dt_commands PENDING -> MQTT cps/greenhouse/dt/cmd/pump/light hoặc cmd/planting_start -> ESP32
+    Digital Twin/Web/Unity -> InfluxDB measurement dt
+    BBB Gateway poll dt PENDING -> MQTT cps/greenhouse/dt/cmd/pump/light hoặc cmd/planting_start -> ESP32
     ESP32 -> cps/greenhouse/actuator/state -> BBB
-    BBB -> InfluxDB actuator_state + dt_command_events
+    BBB -> InfluxDB actuator + cmd/status
 
 Cài đặt:
     pip install paho-mqtt influxdb-client joblib pandas scikit-learn
@@ -24,8 +24,7 @@ Chạy:
     python gateway.py --debug
 
 Lưu ý:
-    File này giữ fallback InfluxDB token theo yêu cầu để chạy ngay.
-    Có thể override bằng biến môi trường nếu cần.
+    File này dùng biến môi trường InfluxDB để tránh hard-code token trong source code.
 """
 
 from __future__ import annotations
@@ -93,12 +92,19 @@ TOPIC_DT_CMD_PUMP = "cps/greenhouse/dt/cmd/pump"
 TOPIC_DT_CMD_LIGHT = "cps/greenhouse/dt/cmd/light"
 
 # ── InfluxDB Cloud ───────────────────────────────────────────────────────────
-# Giữ fallback hard-code theo file cũ để chạy ngay.
-# Có thể override bằng biến môi trường nếu cần.
+# Không hard-code token trong source code. Export biến môi trường trước khi chạy.
 INFLUX_URL_DEFAULT = "https://us-east-1-1.aws.cloud2.influxdata.com"
 INFLUX_TOKEN_DEFAULT = "6pSuWQaFLlWq6iRVfaRYEMwIO1DDEChBsG42HdDx5En6fuqpUx95j3xswbVNrcWxRrs_sizN6XXESjzNqcHzJA=="
 INFLUX_ORG_DEFAULT = "DEV_TEAM"
 INFLUX_BUCKET_DEFAULT = "digital_twin_data"
+
+# InfluxDB measurements đúng theo thiết kế muốn thấy trong Data Explorer.
+# MQTT topic KHÔNG tự tạo bảng InfluxDB; chỉ Point("<measurement>") mới tạo bảng.
+MEAS_SENSORS = "sensors"      # cps/greenhouse/sensors + AI result
+MEAS_STATUS = "status"        # cps/greenhouse/status + latest JSON + planting_start ACK
+MEAS_ACTUATOR = "actuator"    # cps/greenhouse/actuator/state
+MEAS_CMD = "cmd"              # lệnh Gateway/Bridge gửi xuống ESP32 + SENT/DONE/ERROR
+MEAS_DT = "dt"                # queue lệnh Digital Twin/Web/Unity ghi vào InfluxDB
 
 
 WRITE_PRECISION_SECONDS = getattr(WritePrecision, "S", None) or getattr(WritePrecision, "SECONDS")
@@ -224,11 +230,11 @@ class GatewayConfig:
 class InfluxManager:
     """
     InfluxDB usage:
-      sensor_data        : telemetry time-series
-      actuator_state     : physical relay feedback from ESP32
-      latest_state       : JSON snapshot for Digital Twin
-      dt_commands        : command queue written by Digital Twin/Web, gồm pump/light/planting_start
-      dt_command_events  : SENT / DONE / ERROR event log written by Gateway
+      sensors            : telemetry time-series
+      actuator           : physical relay feedback from ESP32
+      status             : status/latest JSON snapshot for Digital Twin
+      dt                 : command queue written by Digital Twin/Web, gồm pump/light/planting_start
+      cmd                : SENT / DONE / ERROR event log written by Gateway
 
     Important:
       InfluxDB is append-only time-series. Gateway does not update old command rows.
@@ -291,7 +297,7 @@ class InfluxManager:
         ctrl = payload["control"]
 
         point = (
-            Point("sensor_data")
+            Point(MEAS_SENSORS)
             .tag("node_id", payload.get("node_id", NODE_ID))
             .tag("plant", PLANT_NAME)
             .tag("phase", str(payload.get("phase", 1)))
@@ -326,7 +332,7 @@ class InfluxManager:
         light = state["light"]
 
         point = (
-            Point("actuator_state")
+            Point(MEAS_ACTUATOR)
             .tag("node_id", state.get("node_id", NODE_ID))
             .tag("pump_state", pump.get("state", "UNKNOWN"))
             .tag("light_state", light.get("state", "UNKNOWN"))
@@ -342,7 +348,7 @@ class InfluxManager:
 
     def write_latest_state(self, key: str, value: dict) -> None:
         point = (
-            Point("latest_state")
+            Point(MEAS_STATUS)
             .tag("node_id", NODE_ID)
             .tag("key", key)
             .field("value_json", json.dumps(value, ensure_ascii=False))
@@ -361,7 +367,7 @@ class InfluxManager:
         error = str(raw.get("error") or "")
 
         point = (
-            Point("planting_start_state")
+            Point(MEAS_STATUS)
             .tag("node_id", raw.get("node_id", NODE_ID))
             .tag("target", "planting_start")
             .tag("status", status or "UNKNOWN")
@@ -378,7 +384,7 @@ class InfluxManager:
 
     def write_command_event(self, command_id: str, target: str, status: str, message: str = "") -> None:
         point = (
-            Point("dt_command_events")
+            Point(MEAS_CMD)
             .tag("node_id", NODE_ID)
             .tag("command_id", command_id)
             .tag("target", target)
@@ -402,7 +408,7 @@ class InfluxManager:
         """
         Digital Twin/Web/Unity writes this same shape to InfluxDB.
 
-        Measurement: dt_commands
+        Measurement: dt
 
         Common tags:
           node_id, command_id, target, status=PENDING
@@ -418,7 +424,7 @@ class InfluxManager:
         target = str(target).strip().lower()
 
         point = (
-            Point("dt_commands")
+            Point(MEAS_DT)
             .tag("node_id", NODE_ID)
             .tag("command_id", command_id)
             .tag("target", target)
@@ -472,7 +478,7 @@ class InfluxManager:
         flux = f"""
 from(bucket: "{self.bucket}")
   |> range(start: -{lookback})
-  |> filter(fn: (r) => r._measurement == "dt_command_events")
+  |> filter(fn: (r) => r._measurement == "{MEAS_CMD}")
   |> keep(columns: ["command_id"])
   |> group()
   |> distinct(column: "command_id")
@@ -490,7 +496,7 @@ from(bucket: "{self.bucket}")
         flux = f"""
 from(bucket: "{self.bucket}")
   |> range(start: -{lookback})
-  |> filter(fn: (r) => r._measurement == "dt_commands")
+  |> filter(fn: (r) => r._measurement == "{MEAS_DT}")
   |> filter(fn: (r) => r.status == "PENDING")
   |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
   |> sort(columns: ["_time"], desc: false)
@@ -1098,6 +1104,15 @@ class GatewayApp:
                     self.last_pump_sent = pump_state
                     self.last_pump_sent_at = now
                     self.log.info(f"→ {TOPIC_CMD_PUMP}: {pump_state}")
+                    try:
+                        self.influx.write_command_event(
+                            "auto_pump",
+                            "pump",
+                            "SENT",
+                            f"topic={TOPIC_CMD_PUMP}; state={pump_state}; reason={pump_reason}",
+                        )
+                    except Exception as exc:
+                        self.log.debug(f"[InfluxDB] auto cmd event write skipped: {exc}")
                 else:
                     self.log.error(f"→ {TOPIC_CMD_PUMP} FAILED rc={result.rc}")
             else:
@@ -1213,7 +1228,7 @@ class GatewayApp:
     # -------------------------------------------------------------------------
 
     def _influx_command_bridge_worker(self) -> None:
-        self.log.info("InfluxDB command bridge started: polling measurement dt_commands.")
+        self.log.info("InfluxDB command bridge started: polling measurement dt.")
         while not self.stop_event.is_set():
             try:
                 commands = self.influx.query_pending_commands(lookback="24h", limit=20)
@@ -1401,5 +1416,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
 

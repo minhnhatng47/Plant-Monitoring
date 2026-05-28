@@ -84,13 +84,14 @@ static const wifi_cred_t WIFI_NETWORKS[] = {
 
 #define NODE_ID              "BRASSICA_JUNCEA_01"
 #define PLANT_NAME           "Rau Cải Mầm (Brassica juncea)"
-#define FW_VERSION           "2.6.0-rtc-nvs-phase-dt-direct"
+#define FW_VERSION           "2.7.0-rtc-nvs-phase-dt-stable"
 
 /* MQTT */
-#define MQTT_BROKER_URI      "mqtt://192.168.2.14"  /* IP hiện tại của BBB/Mosquitto */
+#define MQTT_BROKER_URI      "mqtt://192.168.100.120"  /* IP hiện tại của BBB/Mosquitto */
 #define MQTT_PORT            1883
 #define MQTT_KEEPALIVE_S     60
 #define MQTT_QOS             1
+#define MQTT_CLIENT_ID       "esp32_brassica_01"
 
 #define TOPIC_SENSOR         "cps/greenhouse/sensors"
 #define TOPIC_STATUS         "cps/greenhouse/status"
@@ -98,7 +99,7 @@ static const wifi_cred_t WIFI_NETWORKS[] = {
 
 /* BBB -> ESP32: luồng AUTO chính */
 #define TOPIC_CMD_PUMP       "cps/greenhouse/cmd/pump"
-#define TOPIC_CMD_LIGHT      "cps/greenhouse/cmd/light"      /* legacy/manual */
+#define TOPIC_CMD_LIGHT      "cps/greenhouse/cmd/light"      /* legacy/manual: chỉ log/ignore để tránh xung đột AUTO_RTC */
 #define TOPIC_CMD_PLANTING_START "cps/greenhouse/cmd/planting_start"
 
 /* BBB Influx Bridge -> ESP32: Digital Twin direct command */
@@ -111,8 +112,8 @@ static const wifi_cred_t WIFI_NETWORKS[] = {
 #define I2C_MASTER_PORT      I2C_NUM_0
 
 #define DHT11_GPIO           16
-#define RELAY_PUMP_GPIO      19      /* Active HIGH */
-#define RELAY_LIGHT_GPIO     18      /* Active HIGH */
+#define RELAY_PUMP_GPIO      26      /* Active HIGH */
+#define RELAY_LIGHT_GPIO     27      /* Active HIGH */
 
 /* ADS1115 Configuration */
 #define ADS1115_I2C_ADDR     ADS111X_ADDR_GND   /* 0x48 */
@@ -193,8 +194,8 @@ static const ads111x_mux_t SOIL_MUX[SOIL_CH_COUNT] = {
 #define CORE_NET            0
 #define CORE_APP            1
 
-#define LIGHT_ON_HOUR_UTC7   6
-#define LIGHT_OFF_HOUR_UTC7  20
+#define LIGHT_ON_HOUR_UTC7   8
+#define LIGHT_OFF_HOUR_UTC7  17
 
 /* ADS1115 Calibration */
 #define SOIL_V_DRY           3.0f
@@ -932,8 +933,10 @@ static void publish_planting_status(const char *event, const char *cmd_id, const
         "{"
         "\"node_id\":\"%s\","
         "\"event\":\"%s\","
+        "\"target\":\"planting_start\","
         "\"command_id\":\"%s\","
         "\"status\":\"%s\","
+        "\"source\":\"ESP32_NVS\","
         "\"planting_start_epoch\":%lld,"
         "\"planting_start_time\":\"%s\","
         "\"planting_start_valid\":%s,"
@@ -1472,7 +1475,11 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
             } else if (mqtt_topic_match(ev, TOPIC_DT_CMD_LIGHT)) {
                 handle_dt_light_command(ev, "DIRECT_DT");
             } else if (mqtt_topic_match(ev, TOPIC_CMD_LIGHT)) {
-                handle_dt_light_command(ev, "LEGACY_CMD");
+                /* Topic cũ/legacy. Không cho điều khiển đèn để tránh xung đột với AUTO_RTC.
+                 * Nếu broker còn retained message cũ, ESP32 chỉ log và bỏ qua.
+                 * Digital Twin/Web hãy dùng TOPIC_DT_CMD_LIGHT.
+                 */
+                ESP_LOGW(TAG, "Ignore legacy cmd/light. Use %s instead.", TOPIC_DT_CMD_LIGHT);
             } else if (mqtt_topic_match(ev, TOPIC_CMD_PLANTING_START)) {
                 handle_planting_start_command(ev);
             }
@@ -1486,6 +1493,7 @@ static void mqtt_init(void) {
         .broker.address.uri  = MQTT_BROKER_URI,
         .broker.address.port = MQTT_PORT,
         .session.keepalive   = MQTT_KEEPALIVE_S,
+        .credentials.client_id = MQTT_CLIENT_ID,
     };
     s_mqtt = esp_mqtt_client_init(&cfg);
     esp_mqtt_client_register_event(s_mqtt, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
@@ -1546,17 +1554,31 @@ static void sensor_task(void *pv) {
     i2c_dev_t bh_dev = {0};
     bool bh_ready = false, ads_ready = false;
 
-    if (bh1750_init_desc(&bh_dev, BH1750_I2C_ADDR, I2C_MASTER_PORT, I2C_MASTER_SDA, I2C_MASTER_SCL) == ESP_OK
-        && bh1750_power_on(&bh_dev) == ESP_OK
-        && bh1750_setup(&bh_dev, BH1750_MODE_CONTINUOUS, BH1750_RES_HIGH2) == ESP_OK) {
-        bh_ready = true;
+    if (i2c_take(1500)) {
+        if (bh1750_init_desc(&bh_dev, BH1750_I2C_ADDR, I2C_MASTER_PORT, I2C_MASTER_SDA, I2C_MASTER_SCL) == ESP_OK
+            && bh1750_power_on(&bh_dev) == ESP_OK
+            && bh1750_setup(&bh_dev, BH1750_MODE_CONTINUOUS, BH1750_RES_HIGH2) == ESP_OK) {
+            bh_ready = true;
+        } else {
+            ESP_LOGW(TAG, "BH1750 init/setup chưa sẵn sàng");
+        }
+        i2c_give();
+    } else {
+        ESP_LOGW(TAG, "BH1750 init skip: I2C busy");
     }
 
-    if (ads111x_init_desc(&s_ads_dev, ADS1115_I2C_ADDR, I2C_MASTER_PORT, I2C_MASTER_SDA, I2C_MASTER_SCL) == ESP_OK
-        && ads111x_set_mode(&s_ads_dev, ADS111X_MODE_SINGLE_SHOT) == ESP_OK
-        && ads111x_set_data_rate(&s_ads_dev, ADS111X_DATA_RATE_8) == ESP_OK
-        && ads111x_set_gain(&s_ads_dev, ADS111X_GAIN_4V096) == ESP_OK) {
-        ads_ready = true;
+    if (i2c_take(1500)) {
+        if (ads111x_init_desc(&s_ads_dev, ADS1115_I2C_ADDR, I2C_MASTER_PORT, I2C_MASTER_SDA, I2C_MASTER_SCL) == ESP_OK
+            && ads111x_set_mode(&s_ads_dev, ADS111X_MODE_SINGLE_SHOT) == ESP_OK
+            && ads111x_set_data_rate(&s_ads_dev, ADS111X_DATA_RATE_8) == ESP_OK
+            && ads111x_set_gain(&s_ads_dev, ADS111X_GAIN_4V096) == ESP_OK) {
+            ads_ready = true;
+        } else {
+            ESP_LOGW(TAG, "ADS1115 init/setup chưa sẵn sàng");
+        }
+        i2c_give();
+    } else {
+        ESP_LOGW(TAG, "ADS1115 init skip: I2C busy");
     }
 
     vTaskDelay(pdMS_TO_TICKS(2000));
@@ -1855,9 +1877,11 @@ static void publish_task(void *pv) {
 
 void app_main(void) {
     ESP_LOGI(TAG, "=== %s | %s v%s ===", PLANT_NAME, NODE_ID, FW_VERSION);
-    ESP_LOGI(TAG, "MQTT broker=%s:%d | sensor=%s | auto_pump=%s | dt_pump=%s | dt_light=%s | actuator_state=%s",
-             MQTT_BROKER_URI, MQTT_PORT, TOPIC_SENSOR, TOPIC_CMD_PUMP,
+    ESP_LOGI(TAG, "MQTT broker=%s:%d | client_id=%s | sensor=%s | auto_pump=%s | dt_pump=%s | dt_light=%s | actuator_state=%s",
+             MQTT_BROKER_URI, MQTT_PORT, MQTT_CLIENT_ID, TOPIC_SENSOR, TOPIC_CMD_PUMP,
              TOPIC_DT_CMD_PUMP, TOPIC_DT_CMD_LIGHT, TOPIC_ACTUATOR_STATE);
+    ESP_LOGI(TAG, "Legacy topic %s is ignored; use %s for Digital Twin light direct",
+             TOPIC_CMD_LIGHT, TOPIC_DT_CMD_LIGHT);
     ESP_LOGI(TAG, "Planting topic=%s | start=NVS after RTC/NTP check | dark_days=%.1f",
              TOPIC_CMD_PLANTING_START, DARK_PHASE_DAYS);
 
@@ -1906,3 +1930,4 @@ void app_main(void) {
 
     ESP_LOGI(TAG, "Tất cả tasks đã khởi động (RTC phase owner + Multi-WiFi + DT direct actuator)");
 }
+
