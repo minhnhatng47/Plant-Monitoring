@@ -644,7 +644,7 @@ class EdgeAIWateringController:
             "status": "OK",
             "source": source,
             "errors": [],
-            "need_watering": need,
+            "need_watering": need,z
             "confidence": conf,
             "prob_no_watering": 1.0 - float(need),
             "prob_need_watering": float(need),
