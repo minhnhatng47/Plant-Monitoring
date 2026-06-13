@@ -100,7 +100,7 @@ TOPIC_CMD_LIGHT_DIRECT = f"{TOPIC_ROOT}/{NODE_TOPIC_ID}/cmd/direct/light"
 TOPIC_CMD_PLANTING_START = f"{TOPIC_ROOT}/{NODE_TOPIC_ID}/cmd/config/planting_start"
 
 # ── InfluxDB Cloud ───────────────────────────────────────────────────────────
-# Không hard-code token trong source code. Export biến môi trường trước khi chạy.
+## Không hard-code token trong source code. Export biến môi trường trước khi chạy.
 INFLUX_URL_DEFAULT = "https://us-east-1-1.aws.cloud2.influxdata.com"
 INFLUX_TOKEN_DEFAULT = "6pSuWQaFLlWq6iRVfaRYEMwIO1DDEChBsG42HdDx5En6fuqpUx95j3xswbVNrcWxRrs_sizN6XXESjzNqcHzJA=="
 INFLUX_ORG_DEFAULT = "DEV_TEAM"
@@ -259,7 +259,7 @@ class InfluxManager:
         if not self.token:
             raise RuntimeError("Thiếu INFLUX_TOKEN: kiểm tra INFLUX_TOKEN_DEFAULT hoặc biến môi trường INFLUX_TOKEN.")
 
-        self.client = InfluxDBClient(url=self.url, token=self.token, org=self.org)
+        self.client = InfluxDBClient(url=self.url, token=self.token, org=self.org, timeout=30000)
         self.client.ping()
         self.write_api = self.client.write_api(write_options=SYNCHRONOUS)
         self.query_api = self.client.query_api()
