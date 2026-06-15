@@ -1126,12 +1126,11 @@ class GatewayApp:
             else:
                 self.log.debug(f"Skip duplicate {TOPIC_CMD_PUMP_AUTO}: {pump_state}")
 
+        self.influx.enqueue_telemetry(payload)
         try:
-            self.influx.write_telemetry(payload)
             self.influx.write_latest_state("telemetry", payload)
-            self.log.info("[InfluxDB] telemetry direct write OK")
         except Exception as exc:
-            self.log.error(f"[InfluxDB] telemetry direct write error: {exc}")
+            self.log.debug(f"latest_state telemetry write skipped: {exc}")
 
     def _handle_actuator_state(self, raw: dict) -> None:
         state = parse_actuator_state(raw)
