@@ -8,8 +8,10 @@ Flow topic v2, không dùng SQL local:
 TELEMETRY:
     ESP32 -> MQTT -> Raspberry Pi Gateway -> InfluxDB sensors/status
 
-AUTO CONTROL:
-    ESP32 sensor -> Raspberry Pi Gateway Random Forest -> cps/greenhouse/brassica_01/cmd/auto/pump -> ESP32
+AUTO CONTROL / RECOMMEND MODE:
+    ESP32 sensor -> Raspberry Pi Gateway Random Forest -> AI recommendation/log.
+    AUTO_PUMP_ENABLED=0 (default): Gateway KHÔNG publish cmd/auto/pump, chỉ log/đẩy realtime khuyến nghị AI.
+    AUTO_PUMP_ENABLED=1: Gateway mới publish cps/greenhouse/brassica_01/cmd/auto/pump -> ESP32
 
 DIGITAL TWIN CONTROL:
     Digital Twin/Web/Unity -> InfluxDB measurement dt
@@ -67,7 +69,7 @@ BASE_DIR = Path(__file__).resolve().parent
 
 NODE_ID = "BRASSICA_JUNCEA_01"
 PLANT_NAME = "Rau Cải Mầm (Brassica juncea)"
-GW_VERSION = "3.8.2-direct-guard-stable-command"
+GW_VERSION = "3.8.4-ai-off-safe-model-fallback"
 
 MODEL_PATH = BASE_DIR / "watering_random_forest_model.pkl"
 FEATURES_PATH = BASE_DIR / "model_features.json"
@@ -78,6 +80,15 @@ MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
 MQTT_KEEPALIVE = 60
 MQTT_QOS = 1
 MQTT_CLIENT_ID = "rpi_gateway_brassica_topic_v2"
+
+# v3.8.3: AI recommend-only by default.
+# 0 = Random Forest vẫn dự đoán/log/realtime nhưng KHÔNG tự gửi lệnh bơm.
+# 1 = cho phép Gateway publish cmd/auto/pump xuống ESP32.
+AUTO_PUMP_ENABLED = os.getenv("AUTO_PUMP_ENABLED", "0").strip().lower() in ("1", "true", "yes", "y", "on")
+# v3.8.4: during real dataset collection, AI inference can be disabled completely.
+# - 0 (default): do not call sklearn model; telemetry/realtime still work; pump stays manual only.
+# - 1: call Random Forest for recommendation; AUTO_PUMP_ENABLED still controls whether command is published.
+AI_INFERENCE_ENABLED = os.getenv("AI_INFERENCE_ENABLED", "0").strip().lower() in ("1", "true", "yes", "y", "on")
 
 # MQTT topic tree v2: cps/greenhouse/<node>/...
 TOPIC_ROOT = "cps/greenhouse"
@@ -790,13 +801,46 @@ class EdgeAIWateringController:
                 "phase": phase,
             }
 
+        # v3.8.4: hard AI-off mode for safe real dataset collection.
+        # Keep MQTT/Influx/WebSocket telemetry running, but do not call sklearn model.
+        # This avoids pickle/sklearn-version crashes and guarantees pump remains manual-only.
+        if not AI_INFERENCE_ENABLED:
+            return {
+                "status": "DISABLED",
+                "source": "ai_disabled",
+                "errors": [],
+                "need_watering": 0,
+                "confidence": 0.0,
+                "prob_no_watering": 1.0,
+                "prob_need_watering": 0.0,
+                "action": "PUMP_OFF",
+                "reason": "ai_inference_disabled_collecting_dataset",
+                "phase": phase,
+            }
+
         if soil_moisture <= float(self.cfg.soil_force_on):
             return self._ok("safety_rule", 1, 1.0, "PUMP_ON", "soil_moisture_very_low", phase)
 
         if soil_moisture >= float(self.cfg.soil_force_off):
             return self._ok("safety_rule", 0, 1.0, "PUMP_OFF", "soil_moisture_enough", phase)
 
-        ai = self.predict(temperature, air_humidity, lux, soil_moisture, phase)
+        try:
+            ai = self.predict(temperature, air_humidity, lux, soil_moisture, phase)
+        except Exception as exc:
+            # v3.8.4: model/pickle/sklearn mismatch must not break telemetry path.
+            return {
+                "status": "ERROR",
+                "source": "model_error",
+                "errors": [f"{type(exc).__name__}: {exc}"],
+                "need_watering": None,
+                "confidence": 0.0,
+                "prob_no_watering": 0.0,
+                "prob_need_watering": 0.0,
+                "action": "NO_ACTION",
+                "reason": "model_predict_failed",
+                "phase": phase,
+            }
+
         return {
             "status": "OK",
             "source": "random_forest",
@@ -880,9 +924,21 @@ class EdgeAIWateringController:
         self.pump_on_counter = 0
         self.cooldown_counter = cooldown
 
-    def create_payload(self, sensor: dict, step: int) -> dict:
+    def create_payload(self, sensor: dict, step: int, actuate_enabled: bool = True) -> dict:
         decision = self.decide(sensor)
-        pump_state, ctrl_reason = self.update_pump_state(decision, sensor["soil_avg"])
+
+        if actuate_enabled:
+            # AUTO mode: AI controller is allowed to update internal pump state/cooldown.
+            pump_state, ctrl_reason = self.update_pump_state(decision, sensor["soil_avg"])
+            pump_mode = "AI_AUTO"
+        else:
+            # RECOMMEND mode: Random Forest/AI still predicts, but does NOT own the pump state.
+            # Do not update internal pump_state/cooldown. This avoids a fake AI_ON state when
+            # the real pump is only controlled manually by Web/Unity.
+            pump_state = "ON" if decision.get("action") == "PUMP_ON" else "OFF"
+            ctrl_reason = f"AI_RECOMMEND_ONLY_{decision.get('reason', 'model_prediction')}"
+            pump_mode = "AI_RECOMMEND_ONLY"
+
         self.last_soil = float(sensor["soil_avg"])
 
         phase = int(decision.get("phase", self.resolve_phase(sensor.get("phase"))))
@@ -943,8 +999,9 @@ class EdgeAIWateringController:
             "control": {
                 "pump": {
                     "state": pump_state,
-                    "mode": "AI_AUTO",
+                    "mode": pump_mode,
                     "reason": ctrl_reason,
+                    "auto_publish_enabled": bool(actuate_enabled),
                 },
                 "light": {
                     "state": sensor.get("light_state", "OFF"),
@@ -1185,6 +1242,8 @@ class GatewayApp:
         self.log.info(f"MQTT  : {self.broker}:{self.port}")
         self.log.info(f"Influx: {self.influx.url} org={self.influx.org} bucket={self.influx.bucket}")
         self.log.info(f"Model features: {self.controller.features}")
+        self.log.info(f"AUTO_PUMP_ENABLED={int(AUTO_PUMP_ENABLED)} ({'AI_AUTO_PUBLISH' if AUTO_PUMP_ENABLED else 'AI_RECOMMEND_ONLY'})")
+        self.log.info(f"AI_INFERENCE_ENABLED={int(AI_INFERENCE_ENABLED)} ({'RANDOM_FOREST_ENABLED' if AI_INFERENCE_ENABLED else 'AI_OFF_DATA_COLLECTION'})")
         self.log.info("Flow realtime: ESP32 -> MQTT -> Gateway -> Backend/WebSocket; storage: Gateway -> InfluxDB")
         self.log.info("═" * 72)
 
@@ -1353,7 +1412,7 @@ class GatewayApp:
         gw_step = self._next_gw_step()
         step = sensor["esp_step"] if sensor["esp_step"] > 0 else gw_step
 
-        payload = self.controller.create_payload(sensor, step=step)
+        payload = self.controller.create_payload(sensor, step=step, actuate_enabled=AUTO_PUMP_ENABLED)
         payload["gw_step"] = gw_step
 
         phase = int(payload["phase"])
@@ -1380,6 +1439,12 @@ class GatewayApp:
 
         if self._is_direct_active("pump"):
             self.log.warning(f"SKIP AUTO {TOPIC_CMD_PUMP_AUTO}: Digital Twin direct pump active.")
+        elif not AUTO_PUMP_ENABLED:
+            self.log.warning(
+                f"[AI_RECOMMEND_ONLY] AI recommends Pump {pump_state} "
+                f"source={ai_source} reason={pump_reason} conf={confidence:.0%}; "
+                f"skip MQTT publish {TOPIC_CMD_PUMP_AUTO}"
+            )
         else:
             now = time.time()
             should_publish = (
