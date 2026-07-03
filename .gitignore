@@ -22,3 +22,33 @@ dist/
 # KiCad temporary lock files
 *.lck
 ~*.lck
+# Unity generated files
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Bb]uild/
+[Bb]uilds/
+[Ll]ogs/
+[Uu]ser[Ss]ettings/
+
+Plant_DigitalTwin/Logs/
+Plant_DigitalTwin/outputs/
+Plant_DigitalTwin/UserSettings/
+Plant_DigitalTwin/.vscode/
+
+# Visual Studio / Unity generated
+*.csproj
+*.sln
+*.user
+*.tmp
+
+# Python
+__pycache__/
+venv/
+.venv/
+
+# Archives / packages
+*.zip
+*.rar
+*.7z
+*.unitypackage
